@@ -1,0 +1,7 @@
+jax
+jaxlib
+numpy
+scipy
+matplotlib
+pandas
+iminuit
