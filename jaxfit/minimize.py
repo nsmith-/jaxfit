@@ -16,30 +16,32 @@ def hvp(f, x, v):
 def newton_mfree(f, x, g):
     """Compute the Newton direction using a matrix-free algorithm
 
-    https://en.wikipedia.org/wiki/Newton%27s_method_in_optimization
     Any matrix-free linear solver could be substituted. cg is
     supposed to be the fastest but only applies to symmetric, positive-definite systems
 
-    TODO: consider regularizing hvp(f, x, y) + lambda * y
+    A popular improvement is to truncate the cg algorithm.
+    Another option is to regularize using hvp(f, x, y) + lambda * y
     per http://www.cs.toronto.edu/~jmartens/docs/Deep_HessianFree.pdf
+    or more generally https://en.wikipedia.org/wiki/Trust_region
     """
     y, status = jax.scipy.sparse.linalg.cg(lambda y: hvp(f, x, y), -g)
     # TODO: status not yet implemented, but if it were we should check it for issues
     return y
 
 
-def newton(f, x, g):
-    """Compute the Newton direction
+def newton_hessinv(f, x, g):
+    """Find newton direciton by directly inverting hessian
 
-    https://en.wikipedia.org/wiki/Newton%27s_method_in_optimization
+    This is the most expensive option
     """
     return jnp.linalg.inv(jax.hessian(f)(x)) @ -g
 
 
-def truncated_cg(f, x0, edm_goal=1e-3, maxiter=1000, newton_method=newton):
-    """Conjugate-gradient descent
+def newtons_method(f, x0, edm_goal=1e-3, maxiter=1000, quad_solver=newton_mfree):
+    """Basic Newton's method
 
-    Truncated using the same estimated distance to minimum critera as migrad
+    https://en.wikipedia.org/wiki/Newton%27s_method_in_optimization
+    Terminated using the same estimated distance to minimum critera as migrad
     """
 
     def cond(state):
@@ -50,12 +52,12 @@ def truncated_cg(f, x0, edm_goal=1e-3, maxiter=1000, newton_method=newton):
         niter, x, g, cg, edm = state
         x_next = x + cg
         g_next = jax.grad(f)(x_next)
-        cg_next = newton_method(f, x_next, g_next)
+        cg_next = quad_solver(f, x_next, g_next)
         edm_next = -g_next @ cg_next / 2.0
         return niter + 1, x_next, g_next, cg_next, edm_next
 
     g0 = jax.grad(f)(x0)
-    cg0 = newton_method(f, x0, g0)
+    cg0 = quad_solver(f, x0, g0)
     state = (0, x0, g0, cg0, -g0 @ cg0 / 2.0)
     state = jax.lax.while_loop(cond, step, state)
     niter, x, g, cg, edm = state

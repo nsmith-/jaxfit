@@ -1,4 +1,4 @@
-from jaxfit.minimize import truncated_cg, newton_mfree, migrad
+from jaxfit.minimize import newtons_method, newton_hessinv, migrad
 import jax
 import jax.flatten_util
 import jax.scipy.optimize
@@ -87,15 +87,21 @@ class jitwrap:
 
 
 if __name__ == "__main__":
+
     def run(bins):
         fun, x0 = random_multiprocess(bins)
         minimizers = {
             "mymigrad": jitwrap(partial(migrad, fun), x0),
-            "tcg": jitwrap(partial(truncated_cg, fun), x0),
-            "tcg_mfree": jitwrap(partial(truncated_cg, fun, newton_method=newton_mfree), x0),
-            "bfgs": jitwrap(lambda x0: jax.scipy.optimize.minimize(fun, x0, method="bfgs").x, x0),
+            "newton_hessinv": jitwrap(
+                partial(newtons_method, fun, quad_solver=newton_hessinv), x0
+            ),
+            "newton_cg": jitwrap(partial(newtons_method, fun), x0),
+            "bfgs": jitwrap(
+                lambda x0: jax.scipy.optimize.minimize(fun, x0, method="bfgs").x, x0
+            ),
             "iminuit": iminuitwrap(fun, x0),
         }
+
         def bench(minimizer):
             out = []
             for _ in range(5):
@@ -105,10 +111,12 @@ if __name__ == "__main__":
             out.index.name = "run"
             return out
 
-        bpoints = pd.concat(map(bench, minimizers.values()), keys=minimizers.keys(), names=["minimizer"])
+        bpoints = pd.concat(
+            map(bench, minimizers.values()), keys=minimizers.keys(), names=["minimizer"]
+        )
         return bpoints
 
-    bins = jnp.geomspace(10, 1000, 5, dtype='int32')
+    bins = jnp.geomspace(10, 1000, 5, dtype="int32")
     df = pd.concat(map(run, bins), keys=bins, names=["bins"])
     print(df)
     df.to_pickle("minimizer_benchmark.pkl")
