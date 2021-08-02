@@ -1,10 +1,20 @@
 from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
+from jaxfit.typing import DynamicJaxFunction, DynamicJaxprTracer, JaxPairTuple
 
-def romberg(f, a, b, steps=5, tol=1e-4, debug=False):
+
+def romberg(
+    f: DynamicJaxFunction,
+    a: DynamicJaxprTracer,
+    b: DynamicJaxprTracer,
+    steps: int = 5,
+    tol: float = 1e-4,
+    debug: bool = False,
+) -> DynamicJaxprTracer:
     """1D numerical integration using Romberg method
 
     If steps=None, eagerly evaluate until error estimate
@@ -14,12 +24,12 @@ def romberg(f, a, b, steps=5, tol=1e-4, debug=False):
     https://en.wikipedia.org/wiki/Romberg%27s_method
     """
 
-    def h(n):
+    def h(n: DynamicJaxprTracer) -> DynamicJaxprTracer:
         return (b - a) * (2 ** -n)
 
-    memo = {}
+    memo: JaxPairTuple = {}
 
-    def r(n, m):
+    def r(n: DynamicJaxprTracer, m: DynamicJaxprTracer) -> DynamicJaxprTracer:
         if (n, m) in memo:
             return memo[(n, m)]
         elif n == 0:
@@ -30,7 +40,7 @@ def romberg(f, a, b, steps=5, tol=1e-4, debug=False):
         else:
             out = (4 ** m * r(n, m - 1) - r(n - 1, m - 1)) / (4 ** m - 1)
         if debug:
-            print(f"Romberg {n=} {m=} {out=}")
+            print(f"Romberg n={n} m={m} out={out}")  # noqa
         memo[(n, m)] = out
         return out
 
@@ -43,14 +53,21 @@ def romberg(f, a, b, steps=5, tol=1e-4, debug=False):
     return r(steps, steps)
 
 
-def piecewise(f, edges, integrator=partial(romberg, steps=3)):
+default_integrator = partial(romberg, steps=3)
+
+
+def piecewise(
+    f: DynamicJaxFunction,
+    edges: DynamicJaxprTracer,
+    integrator: Any = default_integrator,
+) -> DynamicJaxprTracer:
     """Compute piecewise integral
 
     Returns an array of size len(edges)-1 corresponding to the
     integral of f between each respective edge.
     """
 
-    def F(a, b):
+    def F(a: DynamicJaxprTracer, b: DynamicJaxprTracer) -> DynamicJaxprTracer:
         return integrator(f, a, b)
 
     return jax.vmap(F)(edges[:-1], edges[1:])
