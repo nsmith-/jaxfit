@@ -4,53 +4,32 @@ See also https://github.com/google/jaxopt
 TODO implicit differentiation using jaxopt.implicit_diff.custom_fixed_point
 TODO test suite with https://en.wikipedia.org/wiki/Test_functions_for_optimization ?
 """
-from typing import Callable, Tuple
-
 import jax
 import jax.numpy as jnp
-from jax.interpreters.partial_eval import DynamicJaxprTracer
 
-NewtonStateTuple = Tuple[
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-]
-
-MigradStateTuple = Tuple[
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-]
-
-DynamicJaxFunction = Callable[[DynamicJaxprTracer], DynamicJaxprTracer]
-
-SolverFunction = Callable[
-    [
-        DynamicJaxFunction,
-        DynamicJaxprTracer,
-        DynamicJaxprTracer,
-    ],
-    DynamicJaxprTracer,
-]
+from jaxfit.types import (  # isort:skip
+    DynamicJaxFunction,
+    MigradStateTuple,
+    NewtonStateTuple,
+    SolverFunction,
+    TracerOrArray,
+)
 
 
 def hvp(
     f: DynamicJaxFunction,
-    x: DynamicJaxprTracer,
-    v: DynamicJaxprTracer,
-) -> DynamicJaxprTracer:
+    x: TracerOrArray,
+    v: TracerOrArray,
+) -> TracerOrArray:
     """Hessian-vector product function"""
     return jax.grad(lambda y: jnp.vdot(jax.grad(f)(y), v))(x)
 
 
 def newton_mfree(
     f: DynamicJaxFunction,
-    x: DynamicJaxprTracer,
-    g: DynamicJaxprTracer,
-) -> DynamicJaxprTracer:
+    x: TracerOrArray,
+    g: TracerOrArray,
+) -> TracerOrArray:
     """Compute the Newton direction using a matrix-free algorithm
 
     Any matrix-free linear solver could be substituted. cg is
@@ -68,9 +47,9 @@ def newton_mfree(
 
 def newton_hessinv(
     f: DynamicJaxFunction,
-    x: DynamicJaxprTracer,
-    g: DynamicJaxprTracer,
-) -> DynamicJaxprTracer:
+    x: TracerOrArray,
+    g: TracerOrArray,
+) -> TracerOrArray:
     """Find newton direciton by directly inverting hessian
 
     This is the most expensive option
@@ -80,18 +59,18 @@ def newton_hessinv(
 
 def newtons_method(
     f: DynamicJaxFunction,
-    x0: DynamicJaxprTracer,
+    x0: TracerOrArray,
     edm_goal: float = 1e-3,
     maxiter: int = 1000,
     quad_solver: SolverFunction = newton_mfree,
-) -> DynamicJaxprTracer:
+) -> TracerOrArray:
     """Basic Newton's method
 
     https://en.wikipedia.org/wiki/Newton%27s_method_in_optimization
     Terminated using the same estimated distance to minimum criteria as migrad
     """
 
-    def cond(state: NewtonStateTuple) -> DynamicJaxprTracer:
+    def cond(state: NewtonStateTuple) -> TracerOrArray:
         niter, _, _, _, edm = state
         return (edm >= edm_goal) & (niter < maxiter)
 
@@ -113,11 +92,11 @@ def newtons_method(
 
 def migrad(
     f: DynamicJaxFunction,
-    x0: DynamicJaxprTracer,
+    x0: TracerOrArray,
     edm_goal: float = 1e-3,
     maxiter: int = 1000,
     debug: int = 0,
-) -> DynamicJaxprTracer:
+) -> TracerOrArray:
     """Something similar to MINUIT migrad algorithm
 
     Uses the DFP algorithm [1] to update an approximate covariance matrix
@@ -126,17 +105,17 @@ def migrad(
     [1] https://en.wikipedia.org/wiki/Davidon%E2%80%93Fletcher%E2%80%93Powell_formula
     """
 
-    def edm(state: MigradStateTuple) -> DynamicJaxprTracer:
+    def edm(state: MigradStateTuple) -> TracerOrArray:
         _, x, g, cov = state
         return jnp.einsum("i,ij,j->", g, cov, g) / 2.0
 
-    def cond(state: MigradStateTuple) -> DynamicJaxprTracer:
+    def cond(state: MigradStateTuple) -> TracerOrArray:
         niter = state[0]
         return (edm(state) >= edm_goal) & (niter < maxiter)
 
     def dfp_update(
-        cov: DynamicJaxprTracer, y: DynamicJaxprTracer, s: DynamicJaxprTracer
-    ) -> DynamicJaxprTracer:
+        cov: TracerOrArray, y: TracerOrArray, s: TracerOrArray
+    ) -> TracerOrArray:
         ycovy = jnp.einsum("i,ij,j->", y, cov, y)
         ys = y @ s
         if debug >= 2:

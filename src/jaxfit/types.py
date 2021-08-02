@@ -1,31 +1,33 @@
-from typing import Callable, Set, Tuple
+from typing import Callable, Set, Tuple, Union
 
 from jax.interpreters.partial_eval import DynamicJaxprTracer
 
-JaxPairTuple = Set[Tuple[DynamicJaxprTracer, DynamicJaxprTracer]]
+TracerOrArray = Union[DynamicJaxprTracer]
 
-DynamicJaxFunction = Callable[[DynamicJaxprTracer], DynamicJaxprTracer]
+JaxPairTuple = Set[Tuple[TracerOrArray, TracerOrArray]]
+
+DynamicJaxFunction = Callable[[TracerOrArray], TracerOrArray]
 
 NewtonStateTuple = Tuple[
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
+    TracerOrArray,
+    TracerOrArray,
+    TracerOrArray,
+    TracerOrArray,
+    TracerOrArray,
 ]
 
 MigradStateTuple = Tuple[
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
-    DynamicJaxprTracer,
+    TracerOrArray,
+    TracerOrArray,
+    TracerOrArray,
+    TracerOrArray,
 ]
 
 SolverFunction = Callable[
     [
-        DynamicJaxFunction,
-        DynamicJaxprTracer,
-        DynamicJaxprTracer,
+        TracerOrArray,
+        TracerOrArray,
+        TracerOrArray,
     ],
-    DynamicJaxprTracer,
+    TracerOrArray,
 ]

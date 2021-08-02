@@ -4,17 +4,17 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from jaxfit.typing import DynamicJaxFunction, DynamicJaxprTracer, JaxPairTuple
+from jaxfit.typing import DynamicJaxFunction, JaxPairTuple, TracerOrArray
 
 
 def romberg(
     f: DynamicJaxFunction,
-    a: DynamicJaxprTracer,
-    b: DynamicJaxprTracer,
+    a: TracerOrArray,
+    b: TracerOrArray,
     steps: int = 5,
     tol: float = 1e-4,
     debug: bool = False,
-) -> DynamicJaxprTracer:
+) -> TracerOrArray:
     """1D numerical integration using Romberg method
 
     If steps=None, eagerly evaluate until error estimate
@@ -24,12 +24,12 @@ def romberg(
     https://en.wikipedia.org/wiki/Romberg%27s_method
     """
 
-    def h(n: DynamicJaxprTracer) -> DynamicJaxprTracer:
+    def h(n: TracerOrArray) -> TracerOrArray:
         return (b - a) * (2 ** -n)
 
     memo: JaxPairTuple = {}
 
-    def r(n: DynamicJaxprTracer, m: DynamicJaxprTracer) -> DynamicJaxprTracer:
+    def r(n: TracerOrArray, m: TracerOrArray) -> TracerOrArray:
         if (n, m) in memo:
             return memo[(n, m)]
         elif n == 0:
@@ -58,16 +58,16 @@ default_integrator = partial(romberg, steps=3)
 
 def piecewise(
     f: DynamicJaxFunction,
-    edges: DynamicJaxprTracer,
+    edges: TracerOrArray,
     integrator: Any = default_integrator,
-) -> DynamicJaxprTracer:
+) -> TracerOrArray:
     """Compute piecewise integral
 
     Returns an array of size len(edges)-1 corresponding to the
     integral of f between each respective edge.
     """
 
-    def F(a: DynamicJaxprTracer, b: DynamicJaxprTracer) -> DynamicJaxprTracer:
+    def F(a: TracerOrArray, b: TracerOrArray) -> TracerOrArray:
         return integrator(f, a, b)
 
     return jax.vmap(F)(edges[:-1], edges[1:])
