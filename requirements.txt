@@ -1,7 +1,7 @@
+iminuit
 jax
 jaxlib
-numpy
-scipy
 matplotlib
+numpy
 pandas
-iminuit
+scipy

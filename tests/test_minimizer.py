@@ -1,12 +1,14 @@
-from jaxfit.minimize import newtons_method, newton_hessinv, migrad
+import time
+from functools import partial
+
 import jax
 import jax.flatten_util
-import jax.scipy.optimize
 import jax.numpy as jnp
-import scipy.stats
-import time
+import jax.scipy.optimize
 import pandas as pd
-from functools import partial
+import scipy.stats
+
+from jaxfit.minimize import migrad, newton_hessinv, newtons_method
 
 
 def random_quadratic():
@@ -86,8 +88,7 @@ class jitwrap:
         return self.jfun(self.x0)
 
 
-if __name__ == "__main__":
-
+def test_minimizer():
     def run(bins):
         fun, x0 = random_multiprocess(bins)
         minimizers = {
@@ -99,7 +100,7 @@ if __name__ == "__main__":
             "bfgs": jitwrap(
                 lambda x0: jax.scipy.optimize.minimize(fun, x0, method="bfgs").x, x0
             ),
-            "iminuit": iminuitwrap(fun, x0),
+            # "iminuit": iminuitwrap(fun, x0),
         }
 
         def bench(minimizer):

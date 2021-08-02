@@ -7,13 +7,29 @@ TODO test suite with https://en.wikipedia.org/wiki/Test_functions_for_optimizati
 import jax
 import jax.numpy as jnp
 
+from jaxfit.types import (  # isort:skip
+    DynamicJaxFunction,
+    MigradStateTuple,
+    NewtonStateTuple,
+    SolverFunction,
+    TracerOrArray,
+)
 
-def hvp(f, x, v):
+
+def hvp(
+    f: DynamicJaxFunction,
+    x: TracerOrArray,
+    v: TracerOrArray,
+) -> TracerOrArray:
     """Hessian-vector product function"""
     return jax.grad(lambda y: jnp.vdot(jax.grad(f)(y), v))(x)
 
 
-def newton_mfree(f, x, g):
+def newton_mfree(
+    f: DynamicJaxFunction,
+    x: TracerOrArray,
+    g: TracerOrArray,
+) -> TracerOrArray:
     """Compute the Newton direction using a matrix-free algorithm
 
     Any matrix-free linear solver could be substituted. cg is
@@ -29,7 +45,11 @@ def newton_mfree(f, x, g):
     return y
 
 
-def newton_hessinv(f, x, g):
+def newton_hessinv(
+    f: DynamicJaxFunction,
+    x: TracerOrArray,
+    g: TracerOrArray,
+) -> TracerOrArray:
     """Find newton direciton by directly inverting hessian
 
     This is the most expensive option
@@ -37,18 +57,24 @@ def newton_hessinv(f, x, g):
     return jnp.linalg.inv(jax.hessian(f)(x)) @ -g
 
 
-def newtons_method(f, x0, edm_goal=1e-3, maxiter=1000, quad_solver=newton_mfree):
+def newtons_method(
+    f: DynamicJaxFunction,
+    x0: TracerOrArray,
+    edm_goal: float = 1e-3,
+    maxiter: int = 1000,
+    quad_solver: SolverFunction = newton_mfree,
+) -> TracerOrArray:
     """Basic Newton's method
 
     https://en.wikipedia.org/wiki/Newton%27s_method_in_optimization
-    Terminated using the same estimated distance to minimum critera as migrad
+    Terminated using the same estimated distance to minimum criteria as migrad
     """
 
-    def cond(state):
+    def cond(state: NewtonStateTuple) -> TracerOrArray:
         niter, _, _, _, edm = state
         return (edm >= edm_goal) & (niter < maxiter)
 
-    def step(state):
+    def step(state: NewtonStateTuple) -> NewtonStateTuple:
         niter, x, g, cg, edm = state
         x_next = x + cg
         g_next = jax.grad(f)(x_next)
@@ -64,7 +90,13 @@ def newtons_method(f, x0, edm_goal=1e-3, maxiter=1000, quad_solver=newton_mfree)
     return x
 
 
-def migrad(f, x0, edm_goal=1e-3, maxiter=1000, debug=0):
+def migrad(
+    f: DynamicJaxFunction,
+    x0: TracerOrArray,
+    edm_goal: float = 1e-3,
+    maxiter: int = 1000,
+    debug: int = 0,
+) -> TracerOrArray:
     """Something similar to MINUIT migrad algorithm
 
     Uses the DFP algorithm [1] to update an approximate covariance matrix
@@ -73,22 +105,24 @@ def migrad(f, x0, edm_goal=1e-3, maxiter=1000, debug=0):
     [1] https://en.wikipedia.org/wiki/Davidon%E2%80%93Fletcher%E2%80%93Powell_formula
     """
 
-    def edm(state):
+    def edm(state: MigradStateTuple) -> TracerOrArray:
         _, x, g, cov = state
         return jnp.einsum("i,ij,j->", g, cov, g) / 2.0
 
-    def cond(state):
+    def cond(state: MigradStateTuple) -> TracerOrArray:
         niter = state[0]
         return (edm(state) >= edm_goal) & (niter < maxiter)
 
-    def dfp_update(cov, y, s):
+    def dfp_update(
+        cov: TracerOrArray, y: TracerOrArray, s: TracerOrArray
+    ) -> TracerOrArray:
         ycovy = jnp.einsum("i,ij,j->", y, cov, y)
         ys = y @ s
         if debug >= 2:
-            print(f"DFP update {y=} {s=}")
+            print(f"DFP update y={y} s={s}")  # noqa
             # https://root.cern.ch/doc/master/DavidonErrorUpdator_8cxx_source.html#l00025
-            print(f"gvg={ycovy}")
-            print(f"delgam={ys}")
+            print(f"gvg={ycovy}")  # noqa
+            print(f"delgam={ys}")  # noqa
         #         if (delgam > gvg) {
         #           // use rank 1 formula
         #           vUpd += gvg * Outer_product(MnAlgebraicVector(dx / delgam - vg / gvg));
@@ -100,7 +134,7 @@ def migrad(f, x0, edm_goal=1e-3, maxiter=1000, debug=0):
             + jnp.einsum("i,j->ij", s, s) / (y @ s)
         )
 
-    def step(state):
+    def step(state: MigradStateTuple) -> MigradStateTuple:
         # https://root.cern.ch/doc/master/VariableMetricBuilder_8cxx_source.html#l00242
         niter, x, g, cov = state
         step = -(cov @ g)
@@ -108,7 +142,7 @@ def migrad(f, x0, edm_goal=1e-3, maxiter=1000, debug=0):
         # https://root.cern.ch/doc/master/MnLineSearch_8cxx_source.html#l00046
         scale = (-g @ step) / (step @ hvp(f, x, step))
         if debug >= 2:
-            print(f"Scaling {step=} by {scale=}")
+            print(f"Scaling step={step} by scale={scale}")  # noqa
         step = step * scale
         x_next = x + step
         g_next = jax.grad(f)(x_next)
@@ -122,14 +156,14 @@ def migrad(f, x0, edm_goal=1e-3, maxiter=1000, debug=0):
     cov_init = jnp.diag(1.0 / jnp.diag(jax.hessian(f)(x0)))
     state = (0, x0, jax.grad(f)(x0), cov_init)
     if debug:
-        print(f"f={f(state[1])} edm={edm(state)}")
+        print(f"f={f(state[1])} edm={edm(state)}")  # noqa
         if debug >= 2:
-            print("{state=}")
+            print("state={state}")  # noqa
         while cond(state):
             state = step(state)
-            print(f"f={f(state[1])} edm={edm(state)}")
+            print(f"f={f(state[1])} edm={edm(state)}")  # noqa
             if debug >= 2:
-                print("{state=}")
+                print("state={state}")  # noqa
     else:
         state = jax.lax.while_loop(cond, step, state)
     niter, x, g, cov = state
