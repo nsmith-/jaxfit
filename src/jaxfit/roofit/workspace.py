@@ -1,4 +1,7 @@
+import json
 from typing import Any, Type
+
+from jaxfit.roofit.model import Model
 
 
 class RooWorkspace:
@@ -7,12 +10,12 @@ class RooWorkspace:
     @classmethod
     def register(cls, model: Type):
         cls.models[model.__name__] = model
+        return model
 
     def __init__(self):
         self._inputobj = {}
-        self._out = {
-            "_roots": [],
-        }
+        self._out = {}
+        self._roots = []
         self._unknown_classes = set()
 
     def getref(self, obj: Any) -> str:
@@ -40,17 +43,20 @@ class RooWorkspace:
         self._inputobj[name] = obj
         return name
 
-    def readobj(self, obj):
-        ref = self._readobj(obj)
-        self._out["_roots"].append(ref)
+    def readobj(self, obj: Any):
+        self._roots.append(self._readobj(obj))
 
     def to_file(self, fname: str):
-        import json
-
         with open(fname, "w") as fout:
-            json.dump(self._out, fout)
+            json.dump(
+                {
+                    name: json.loads(model.to_json())
+                    for name, model in self._out.items()
+                },
+                fout,
+            )
 
-    def _readobj(self, obj):
+    def _readobj(self, obj: Any) -> Model:
         name = self.getref(obj)
         try:
             return self._out[name]
@@ -59,13 +65,11 @@ class RooWorkspace:
         objclass = obj.Class().GetName()
 
         try:
-            out = self.models[objclass].readobj(obj, self._readobj)
+            model = self.models[objclass].readobj(obj, self._readobj)
         except KeyError:
             self._unknown_classes.add(objclass)
-            out = {"children": []}
-            for child in obj.servers():
-                out["children"].append(self._readobj(child))
+            model = self.models["_Unknown"].readobj(obj, self._readobj)
 
-        out["class"] = objclass
-        self._out[name] = out
-        return {"$ref": f"/{name}"}
+        model.name = name
+        self._out[name] = model
+        return model

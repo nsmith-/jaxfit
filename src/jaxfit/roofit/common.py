@@ -1,60 +1,112 @@
 """Built-in RooFit objects
 """
+from dataclasses import dataclass
+from typing import Any, List
+
 from jaxfit.roofit._util import _importROOT
+from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
 
 
 @RooWorkspace.register
-class RooProdPdf:
+@dataclass
+class _Unknown(Model):
+    children: List[Model]
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        return cls(children=[recursor(child) for child in obj.servers()])
+
+
+@RooWorkspace.register
+@dataclass
+class RooProdPdf(Model):
+    pdfs: List[Model]
+
     @classmethod
     def readobj(cls, obj, recursor):
         assert set(obj.pdfList()) == set(obj.servers())
-        return {
-            "pdfs": [recursor(pdf) for pdf in obj.pdfList()],
-        }
+        return cls(
+            pdfs=[recursor(pdf) for pdf in obj.pdfList()],
+        )
 
 
 @RooWorkspace.register
-class RooCategory:
+@dataclass
+class RooCategory(Model):
+    labels: List[str]
+
     @classmethod
     def readobj(cls, obj, recursor):
-        return {
-            "labels": [label for label, idx in obj.states()],
-        }
+        return cls(
+            labels=[label for label, idx in obj.states()],
+        )
 
 
 @RooWorkspace.register
-class RooProduct:
+@dataclass
+class RooProduct(Model):
+    components: List[Model]
+
     @classmethod
     def readobj(cls, obj, recursor):
-        return {"components": [recursor(x) for x in obj.components()]}
+        return cls(components=[recursor(x) for x in obj.components()])
 
 
 @RooWorkspace.register
-class RooConstVar:
+@dataclass
+class RooConstVar(Model):
+    val: float
+
     @classmethod
     def readobj(cls, obj, recursor):
-        return {"val": obj.getVal()}
+        return cls(val=obj.getVal())
 
 
 @RooWorkspace.register
-class RooRealSumPdf:
+@dataclass
+class RooRealSumPdf(Model):
+    functions: List[Model]
+    coefficients: List[Model]
+
     @classmethod
     def readobj(cls, obj, recursor):
-        return {
-            "functions": [recursor(f) for f in obj.funcList()],
-            "coefficients": [recursor(c) for c in obj.coefList()],
-        }
+        return cls(
+            functions=[recursor(f) for f in obj.funcList()],
+            coefficients=[recursor(c) for c in obj.coefList()],
+        )
 
 
 @RooWorkspace.register
-class RooPoisson:
+@dataclass
+class RooPoisson(Model):
+    x: Model
+    mean: Model
+
     @classmethod
     def readobj(cls, obj, recursor):
         # FIXME: in ROOT 6.24 we get proxy accessors (getProxy/numProxies)
         # For now assume servers always in correct order
         x, mean = obj.servers()
-        return {"x": recursor(x), "mean": recursor(mean)}
+        return cls(x=recursor(x), mean=recursor(mean))
+
+
+@RooWorkspace.register
+@dataclass
+class RooGaussian(Model):
+    x: Model
+    mean: Model
+    sigma: Model
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        # FIXME: in ROOT 6.24 we get proxy accessors (getProxy/numProxies)
+        x, mean, sigma = obj.servers()
+        return cls(
+            x=recursor(obj.getX()),
+            mean=recursor(obj.getMean()),
+            sigma=recursor(obj.getSigma()),
+        )
 
 
 def _parse_binning(binning, recursor):
@@ -75,19 +127,25 @@ def _parse_binning(binning, recursor):
 
 
 @RooWorkspace.register
-class RooRealVar:
+@dataclass
+class RooRealVar(Model):
+    val: float
+    min: float
+    max: float
+    const: bool
+    binning: Any = None  # FIXME: proper classes
+
     @classmethod
     def readobj(cls, obj, recursor):
-        assert len(obj.servers()) == 0
-        out = {
-            "val": obj.getVal(),
-            "min": obj.getMin(),
-            "max": obj.getMax(),
-            "const": obj.getAttribute("Constant"),
-        }
+        out = cls(
+            val=obj.getVal(),
+            min=obj.getMin(),
+            max=obj.getMax(),
+            const=obj.getAttribute("Constant"),
+        )
         bnames = list(obj.getBinningNames())
         if bnames == [""]:
-            out["binning"] = _parse_binning(obj.getBinning(""), recursor)
+            out.binning = _parse_binning(obj.getBinning(""), recursor)
         else:
             # mostly because I don't know the use case
             raise NotImplementedError("Multiple binnings for RooRealVar")
@@ -95,17 +153,22 @@ class RooRealVar:
 
 
 @RooWorkspace.register
-class RooDataSet:
+@dataclass
+class RooDataSet(Model):
+    observables: List[Model]
+    points: List[List[float]]
+    weights: List[float] = None
+
     @classmethod
     def readobj(cls, obj, recursor):
         ROOT = _importROOT()
         data = obj.store()
         if not isinstance(data, ROOT.RooVectorDataStore):
             raise NotImplementedError("Non-memory data stores")
-        out = {
-            "observables": [recursor(p) for p in data.row()],
-            "points": [list(p) for p in data.getBatch(0, data.size())],
-        }
+        out = cls(
+            observables=[recursor(p) for p in data.row()],
+            points=[list(p) for p in data.getBatch(0, data.size())],
+        )
         if data.isWeighted():
-            out["weights"] = (list(data.getWeightBatch(0, data.size())),)
+            out.weights = list(data.getWeightBatch(0, data.size()))
         return out
