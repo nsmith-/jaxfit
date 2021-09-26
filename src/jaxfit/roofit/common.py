@@ -3,9 +3,12 @@
 from dataclasses import dataclass
 from typing import Any, List
 
+import jax.numpy as jnp
+
 from jaxfit.roofit._util import _importROOT
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
+from jaxfit.types import Array
 
 
 @RooWorkspace.register
@@ -122,7 +125,9 @@ def _parse_binning(binning, recursor):
         raise NotImplementedError("RooParamBinning")
     return {
         "type": "edges",
-        "edges": [binning.binLow(i) for i in range(n)] + [binning.binHigh(n - 1)],
+        "edges": jnp.array(
+            [binning.binLow(i) for i in range(n)] + [binning.binHigh(n - 1)]
+        ),
     }
 
 
@@ -156,8 +161,8 @@ class RooRealVar(Model):
 @dataclass
 class RooDataSet(Model):
     observables: List[Model]
-    points: List[List[float]]
-    weights: List[float] = None
+    points: Array  # 2d
+    weights: Array = None  # 1d
 
     @classmethod
     def readobj(cls, obj, recursor):
@@ -167,8 +172,8 @@ class RooDataSet(Model):
             raise NotImplementedError("Non-memory data stores")
         out = cls(
             observables=[recursor(p) for p in data.row()],
-            points=[list(p) for p in data.getBatch(0, data.size())],
+            points=jnp.array([list(p) for p in data.getBatch(0, data.size())]),
         )
         if data.isWeighted():
-            out.weights = list(data.getWeightBatch(0, data.size()))
+            out.weights = jnp.array(list(data.getWeightBatch(0, data.size())))
         return out

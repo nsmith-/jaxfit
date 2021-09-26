@@ -1,8 +1,10 @@
 from typing import Callable, Set, Tuple, Union
 
+import jaxlib.xla_extension
 from jax.interpreters.partial_eval import DynamicJaxprTracer
 
-TracerOrArray = Union[DynamicJaxprTracer]
+Array = jaxlib.xla_extension.DeviceArray
+TracerOrArray = Union[DynamicJaxprTracer, Array]
 
 JaxPairTuple = Set[Tuple[TracerOrArray, TracerOrArray]]
 

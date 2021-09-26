@@ -1,3 +1,4 @@
+import gzip
 import json
 from typing import Any, Type
 
@@ -12,11 +13,19 @@ class RooWorkspace:
         cls.models[model.__name__] = model
         return model
 
-    def __init__(self):
+    def __init__(self, models=None, roots=None):
         self._inputobj = {}
-        self._out = {}
-        self._roots = []
+        self._out = {} if models is None else models
+        self._roots = [] if roots is None else roots
         self._unknown_classes = set()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_inputobj")
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
     def getref(self, obj: Any) -> str:
         """
@@ -46,15 +55,47 @@ class RooWorkspace:
     def readobj(self, obj: Any):
         self._roots.append(self._readobj(obj))
 
+    @classmethod
+    def from_file(cls, fname: str):
+        if fname.endswith(".gz"):
+            with gzip.open(fname, "rt") as fin:
+                data = json.load(fin)
+        else:
+            with open(fname, "r") as fin:
+                data = json.load(fin)
+
+        roots = data.pop("_roots")
+        out = {}
+
+        def deref(name):
+            try:
+                return out[name]
+            except KeyError:
+                pass
+            clsname = name.split(":")[0]
+            try:
+                objclass = cls.models[clsname]
+            except KeyError:
+                raise RuntimeError(f"Unknown Model class {clsname} in file {fname}")
+
+            model = objclass.from_dict(data.pop(name), deref)
+            model.name = name
+            out[name] = model
+            return model
+
+        for name in roots:
+            deref(name)
+        return cls(models=out, roots=[out[name] for name in roots])
+
     def to_file(self, fname: str):
-        with open(fname, "w") as fout:
-            json.dump(
-                {
-                    name: json.loads(model.to_json())
-                    for name, model in self._out.items()
-                },
-                fout,
-            )
+        data = {name: model.to_dict() for name, model in self._out.items()}
+        data["_roots"] = [r.name for r in self._roots]
+        if fname.endswith(".gz"):
+            with gzip.open(fname, "wt") as fout:
+                json.dump(data, fout)
+        else:
+            with open(fname, "w") as fout:
+                json.dump(data, fout)
 
     def _readobj(self, obj: Any) -> Model:
         name = self.getref(obj)

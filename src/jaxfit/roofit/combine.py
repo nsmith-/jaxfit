@@ -1,22 +1,25 @@
 """Custom RooFit objects found in CMS combine
 """
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Dict, List
+
+import jax.numpy as jnp
 
 from jaxfit.roofit.common import RooCategory, RooGaussian
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
+from jaxfit.types import Array
 
 
-def _fasthisto2list(h):
-    return [h[i] for i in range(h.size())]
+def _fasthisto2array(h):
+    return jnp.array([h[i] for i in range(h.size())])
 
 
 @RooWorkspace.register
 @dataclass
 class RooSimultaneousOpt(Model):
     indexCat: RooCategory
-    components: Dict[str, Any]
+    components: Dict[str, Model]
 
     @classmethod
     def readobj(cls, obj, recursor):
@@ -36,9 +39,9 @@ class RooSimultaneousOpt(Model):
 class ProcessNormalization(Model):
     nominal: float
     symParams: List[Model]  # TODO: abstract parameter?
-    symLogKappa: List[float]
+    symLogKappa: Array  # 1d
     asymParams: List[Model]
-    asymLogKappa: List[float]
+    asymLogKappa: Array  # (param, lo/hi)
     additional: List[Model]
 
     @classmethod
@@ -46,9 +49,9 @@ class ProcessNormalization(Model):
         return cls(
             nominal=obj.getNominalValue(),
             symParams=[recursor(p) for p in obj.getSymErrorParameters()],
-            symLogKappa=list(obj.getSymLogKappa()),
+            symLogKappa=jnp.array(list(obj.getSymLogKappa())),
             asymParams=[recursor(p) for p in obj.getAsymErrorParameters()],
-            asymLogKappa=[(lo, hi) for lo, hi in obj.getAsymLogKappa()],
+            asymLogKappa=jnp.array([[lo, hi] for lo, hi in obj.getAsymLogKappa()]),
             additional=[recursor(p) for p in obj.getAdditionalModifiers()],
         )
 
@@ -77,10 +80,10 @@ class CMSHistErrorPropagator(Model):
 class CMSHistFunc(Model):
     x: Model
     verticalParams: List[Model]
-    verticalMorphsLo: List[List[float]]
-    verticalMorphsHi: List[List[float]]
-    bberrors: List[float]
-    nominal: List[float]
+    verticalMorphsLo: Array  # 2d: (param, bin)
+    verticalMorphsHi: Array  # 2d: (param, bin)
+    bberrors: Array  # 1d
+    nominal: Array  # 1d
 
     @classmethod
     def readobj(cls, obj, recursor):
@@ -89,24 +92,23 @@ class CMSHistFunc(Model):
         morphs = [
             {
                 "param": recursor(p),
-                "lo": _fasthisto2list(obj.getShape(0, 0, i + 1, 0)),
-                "hi": _fasthisto2list(obj.getShape(0, 0, i + 1, 1)),
+                "lo": _fasthisto2array(obj.getShape(0, 0, i + 1, 0)),
+                "hi": _fasthisto2array(obj.getShape(0, 0, i + 1, 1)),
             }
             for i, p in enumerate(obj.getVerticalMorphs())
         ]
         return cls(
             x=recursor(obj.getXVar()),
             verticalParams=[m["param"] for m in morphs],
-            verticalMorphsLo=[m["lo"] for m in morphs],
-            verticalMorphsHi=[m["hi"] for m in morphs],
-            bberrors=_fasthisto2list(obj.errors()),
-            nominal=_fasthisto2list(obj.getShape(0, 0, 0, 0)),
+            verticalMorphsLo=jnp.array([m["lo"] for m in morphs]),
+            verticalMorphsHi=jnp.array([m["hi"] for m in morphs]),
+            bberrors=_fasthisto2array(obj.errors()),
+            nominal=_fasthisto2array(obj.getShape(0, 0, 0, 0)),
         )
 
 
 @RooWorkspace.register
 @dataclass
 class SimpleGaussianConstraint(RooGaussian):
-    blah: int = 1
-    pass
     # combine implements a fast logpdf for this, hence the specializtion
+    pass
