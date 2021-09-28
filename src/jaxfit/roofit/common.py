@@ -117,8 +117,7 @@ def _parse_binning(binning, recursor):
     if binning.isUniform():
         return {
             "type": "uniform",
-            "lo": binning.lowBound(),
-            "hi": binning.highBound(),
+            "edges": jnp.array([binning.lowBound(), binning.highBound()]),
             "n": n,
         }
     elif binning.isParameterized():
@@ -128,6 +127,7 @@ def _parse_binning(binning, recursor):
         "edges": jnp.array(
             [binning.binLow(i) for i in range(n)] + [binning.binHigh(n - 1)]
         ),
+        "n": n,
     }
 
 
@@ -175,5 +175,8 @@ class RooDataSet(Model):
             points=jnp.array([list(p) for p in data.getBatch(0, data.size())]),
         )
         if data.isWeighted():
+            # if w2 == w we can assume, at least for combine, that this is binned poisson (or asimov)
+            # check that data = bin centers
+            # if w2 != w we might need to do some apprixmation a la RooFit.SumW2Error(True) minimizer option
             out.weights = jnp.array(list(data.getWeightBatch(0, data.size())))
         return out
