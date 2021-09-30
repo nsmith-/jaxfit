@@ -2,19 +2,12 @@
 """
 from dataclasses import dataclass
 from functools import reduce
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Union
 
 import jax.numpy as jnp
-import jax.scipy.special as special
 import jax.scipy.stats as stats
 
-from jaxfit.roofit.common import (
-    RooCategory,
-    RooConstVar,
-    RooGaussian,
-    RooProduct,
-    RooRealVar,
-)
+from jaxfit.roofit.common import RooCategory, RooConstVar, RooGaussian, RooProduct
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
 from jaxfit.types import Array, Distribution, Function
@@ -44,22 +37,28 @@ class RooSimultaneousOpt(Model, Distribution):
 
     @property
     def observables(self):
-        out = reduce(set.union, (pdf.observables for pdf in self.pdfs.items()), set())
+        out = reduce(set.union, (pdf.observables for pdf in self.pdfs.values()), set())
         if out & {self.indexCat.name}:
             raise RuntimeError("gotta think")
         return out | {self.indexCat.name}
 
     @property
     def parameters(self) -> Set[str]:
-        return reduce(set.union, (pdf.parameters for pdf in self.pdfs.items()), set())
+        return reduce(set.union, (pdf.parameters for pdf in self.pdfs.values()), set())
 
     def log_prob(self, observables: Set[str], parameters: Set[str]):
-        missing = self.parameters - parameters
-        if missing:
-            raise RuntimeError(f"Missing parameters: {missing} in pdf {self.name}")
-        missing = {self.observable.name} - observables
-        if missing:
-            raise RuntimeError(f"Missing observables: {missing} in pdf {self.name}")
+        vals = []
+        for pdf in self.pdfs.values():
+            vals.append(pdf.log_prob(observables, parameters))
+            # FIXME: combine-specific hack to identify global observables (prevent double-fitting)
+            observables = observables - {
+                var for var in pdf.observables if var.endswith("_In")
+            }
+
+        def logp(data, param):
+            return sum(val(data[cat], param) for cat, val in zip(self.pdfs, vals))
+
+        return logp
 
 
 def _asym_interpolation(θ, δp, δm):
@@ -89,26 +88,29 @@ class ProcessNormalization(Model, Function):
     symParams: List[Model]  # TODO: abstract parameter?
     symLogKappa: Array  # 1d
     asymParams: List[Model]
-    asymLogKappa: Array  # (param, lo/hi)
+    asymLogKappaLo: Array  # 1d
+    asymLogKappaHi: Array  # 1d
     additional: List[Model]
 
     @classmethod
     def readobj(cls, obj, recursor):
+        asympar = [[lo, hi] for lo, hi in obj.getAsymLogKappa()]
         return cls(
             nominal=obj.getNominalValue(),
             symParams=[recursor(p) for p in obj.getSymErrorParameters()],
             symLogKappa=jnp.array(list(obj.getSymLogKappa())),
             asymParams=[recursor(p) for p in obj.getAsymErrorParameters()],
-            asymLogKappa=jnp.array([[lo, hi] for lo, hi in obj.getAsymLogKappa()]),
+            asymLogKappaLo=jnp.array([p[0] for p in asympar]),
+            asymLogKappaHi=jnp.array([p[1] for p in asympar]),
             additional=[recursor(p) for p in obj.getAdditionalModifiers()],
         )
 
     @property
     def parameters(self):
-        return (
-            set(p.name for p in self.symParams)
-            | set(p.name for p in self.asymParams)
-            | set(p.name for p in self.additional)
+        return reduce(
+            set.union,
+            (p.parameters for p in self.symParams + self.asymParams + self.additional),
+            set(),
         )
 
     def value(self, parameters):
@@ -122,26 +124,60 @@ class ProcessNormalization(Model, Function):
             asymTheta = jnp.array([param[p.name] for p in self.asymParams])
             asymShift = jnp.sum(
                 _asym_interpolation(
-                    asymTheta, self.asymLogKappa[:, 1], self.asymLogKappa[:, 0]
+                    asymTheta, self.asymLogKappaLo, self.asymLogKappaHi
                 ),
                 axis=-1,
             )
-            addFactor = jnp.prod([param[p.name] for p in self.additional])
+            addFactor = jnp.prod(jnp.array([param[p.name] for p in self.additional]))
             return self.nominal * jnp.exp(symShift + asymShift) * addFactor
 
         return val
 
 
-def _bbparse(param):
-    """Guess based on structure if scaled poisson or gaussian"""
-    if isinstance(param, RooProduct) and len(param.components) == 2:
-        realparam, scale = param.components
-        if not isinstance(scale, RooConstVar):
-            raise RuntimeError("unexpected type while parsing barlow beeston")
-        return realparam, scale.val
-    elif isinstance(param, RooRealVar):
-        return param, 0.0
-    raise RuntimeError("unexpected type while parsing barlow beeston")
+def _bbparse(obj, functions, recursor):
+    bbpars = []
+    bbscale = []
+    pariter = (recursor(p) for p in obj.binparsList())
+    nch = len(functions)
+    for bintype in obj.binTypes():
+        if len(bintype) == 1 and bintype[0] == 0:
+            # No MC stat
+            bbpars.append([0.0] * len(functions))
+            bbscale.append([0.0] * len(functions))
+        elif len(bintype) == 1 and bintype[0] == 1:
+            # BB-lite (single gaussian)
+            bbpars.append([next(pariter)] + [0.0] * (nch - 1))
+            bbscale.append([-1.0] + [0.0] * (nch - 1))
+        else:
+            procpar = []
+            procscale = []
+            for proc, binproctype in zip(functions, bintype):
+                if binproctype == 2:
+                    # Full BB, Poisson
+                    param = next(pariter)
+                    if not isinstance(param, RooProduct):
+                        raise RuntimeError(
+                            "unexpected type while parsing barlow beeston"
+                        )
+                    realparam, scale = param.components
+                    if not isinstance(scale, RooConstVar):
+                        raise RuntimeError(
+                            "unexpected type while parsing barlow beeston"
+                        )
+                    procpar.append(realparam)
+                    procscale.append(scale.val)
+                elif binproctype == 3:
+                    # Full BB, Gaussian
+                    procpar.append(next(pariter))
+                    procscale.append(0.0)
+                else:
+                    # This process doesn't contribute
+                    procpar.append(0.0)
+                    procscale.append(0.0)
+            bbpars.append(procpar)
+            bbscale.append(procscale)
+
+    return bbpars, jnp.array(bbscale)
 
 
 @RooWorkspace.register
@@ -151,26 +187,25 @@ class CMSHistErrorPropagator(Model, Distribution):
     x: Model
     functions: List[Model]
     coefficients: List[Model]
-    bbpars: List[Model]
-    bbscale: Array
+    bbpars: List[List[Union[Model, float]]]
+    bbscale: Array  # 2d: bin, proc
 
     @classmethod
     def readobj(cls, obj, recursor):
-        bbpars = []
-        bbscale = []
-        for p in obj.binparsList():
-            realp, scale = _bbparse(recursor(p))
-            bbpars.append(realp)
-            bbscale.append(scale)
+        functions = [recursor(f) for f in obj.funcList()]
+        bbpars, bbscale = _bbparse(obj, functions, recursor)
         out = cls(
             x=recursor(obj.getX()),
-            functions=[recursor(f) for f in obj.funcList()],
+            functions=functions,
             coefficients=[recursor(c) for c in obj.coefList()],
             bbpars=bbpars,
-            bbscale=jnp.array(bbscale),
+            bbscale=bbscale,
         )
         assert all(isinstance(x, CMSHistFunc) for x in out.functions)
-        assert all(isinstance(x, ProcessNormalization) for x in out.coefficients)
+        assert all(
+            isinstance(x, ProcessNormalization) or x.name == "RooRealVar:ZERO"
+            for x in out.coefficients
+        )
         assert len(out.bbpars) == out.x.binning.n
         return out
 
@@ -182,46 +217,64 @@ class CMSHistErrorPropagator(Model, Distribution):
     def parameters(self):
         fpars = reduce(set.union, (x.parameters for x in self.functions), set())
         cpars = reduce(set.union, (x.parameters for x in self.coefficients), set())
-        bpars = set(p.name for p in self.bbpars)
+        bpars = reduce(
+            set.union,
+            (
+                p.parameters
+                for procpars in self.bbpars
+                for p in procpars
+                if not isinstance(p, float)
+            ),
+            set(),
+        )
         return fpars | cpars | bpars
 
     def log_prob(self, observables: Set[str], parameters: Set[str]):
         missing = self.parameters - parameters
         if missing:
             raise RuntimeError(f"Missing parameters: {missing} in pdf {self.name}")
-        missing = {self.observable.name} - observables
+        missing = self.observables - observables
         if missing:
             raise RuntimeError(f"Missing observables: {missing} in pdf {self.name}")
-        bberrors = jnp.sqrt(sum(f.bberrors ** 2 for f in self.functions))
+
+        chvals = [
+            (f.value(parameters), c.value(parameters))
+            for f, c in zip(self.functions, self.coefficients)
+        ]
+        bb_errors = jnp.array([f.bberrors for f in self.functions]).T
+        bblite_errors = jnp.sqrt(jnp.sum(bb_errors ** 2, axis=0))
 
         def logp(data, param):
             if len(data["weight"]) != len(self.bbpars):
                 # FIXME: would be better to make a binned data indicator?
                 # in principle we can do a binned fit to unbinned data via jnp.searchsorted, jnp.bincount
                 raise RuntimeError("not correctly binned data?")
-            observed_total = jnp.sum(data["weight"], axis=-1)
-            observed_diff = data["weight"] / observed_total
-            # FIXME: can f be an integral of a unbinned pdf?
-            expected_extended = sum(
-                f(parameters) * c(parameters)
-                for f, c in zip(self.functions, self.coefficients)
-            )
+            observed = data["weight"]
+            expected_perchannel = jnp.array([f(param) * c(param) for f, c in chvals]).T
             # here we can do analytic Balow-Beeston in principle
-            bbparams = jnp.array([param[p.name] for p in self.bbparams])
-            expected_extended = expected_extended * jnp.where(
-                self.bbscale > 0.0, bbparams, 1.0
-            ) + jnp.where(self.bbscale == 0.0, bberrors * bbparams, 0.0)
-            expected_total = jnp.sum(expected_extended)
-            expected_diff = expected_extended / expected_total
-            # Poisson normalization term
-            nterm = stats.poisson.logpmf(observed_total, expected_total)
-            # Multinomial distribution term
-            dterm = special.gammaln(observed_total + 1) + jnp.sum(
-                special.xlogy(observed_diff, expected_diff)
-                - special.gammaln(observed_diff + 1),
-                axis=-1,
+            bbparams = jnp.array(
+                [
+                    [p if isinstance(p, float) else param[p.name] for p in procpars]
+                    for procpars in self.bbpars
+                ]
             )
-            return nterm + dterm
+            expected_perchannel = expected_perchannel + jnp.where(
+                self.bbscale > 0.0,
+                (bbparams * self.bbscale - 1) * expected_perchannel,
+                jnp.where(
+                    self.bbscale == 0.0,
+                    bb_errors * bbparams,
+                    jnp.where(self.bbscale == -1.0, bblite_errors * bbparams, 0.0),
+                ),
+            )
+            expected = jnp.sum(expected_perchannel, axis=1)
+            return jnp.sum(stats.poisson.logpmf(observed, expected))
+            # Multinomial distribution term
+            # dterm = special.gammaln(observed_total + 1) + jnp.sum(
+            #     special.xlogy(observed_diff, expected_diff)
+            #     - special.gammaln(observed_diff + 1),
+            #     axis=-1,
+            # )
 
         return logp
 
@@ -259,11 +312,7 @@ class CMSHistFunc(Model, Function):
 
     @property
     def parameters(self):
-        return (
-            set(p.name for p in self.symParams)
-            | set(p.name for p in self.asymParams)
-            | set(p.name for p in self.additional)
-        )
+        return reduce(set.union, (p.parameters for p in self.verticalParams), set())
 
     def value(self, parameters):
         missing = self.parameters - parameters
@@ -287,4 +336,17 @@ class CMSHistFunc(Model, Function):
 @dataclass
 class SimpleGaussianConstraint(RooGaussian):
     # combine implements a fast logpdf for this, hence the specializtion
-    pass
+    @classmethod
+    def readobj(cls, obj, recursor):
+        out = cls(
+            # bug in combine switches the aux data and the param
+            x=recursor(obj.getMean()),
+            mean=recursor(obj.getX()),
+            sigma=recursor(obj.getSigma()),
+        )
+        if out.mean.name.endswith("_In"):
+            raise RuntimeError()
+        if not out.x.name.endswith("_In"):
+            raise RuntimeError()
+
+        return out

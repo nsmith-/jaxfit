@@ -1,14 +1,16 @@
 """Built-in RooFit objects
 """
 from dataclasses import dataclass
-from typing import Any, List
+from functools import reduce
+from typing import Any, List, Set
 
 import jax.numpy as jnp
+import jax.scipy.stats as stats
 
 from jaxfit.roofit._util import _importROOT
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
-from jaxfit.types import Array
+from jaxfit.types import Array, Distribution, Function
 
 
 @RooWorkspace.register
@@ -23,7 +25,7 @@ class _Unknown(Model):
 
 @RooWorkspace.register
 @dataclass
-class RooProdPdf(Model):
+class RooProdPdf(Model, Distribution):
     pdfs: List[Model]
 
     @classmethod
@@ -32,6 +34,28 @@ class RooProdPdf(Model):
         return cls(
             pdfs=[recursor(pdf) for pdf in obj.pdfList()],
         )
+
+    @property
+    def observables(self):
+        return reduce(set.union, (pdf.observables for pdf in self.pdfs), set())
+
+    @property
+    def parameters(self) -> Set[str]:
+        return reduce(set.union, (pdf.parameters for pdf in self.pdfs), set())
+
+    def log_prob(self, observables: Set[str], parameters: Set[str]):
+        # TODO: we don't really want to skip pdfs with missing observables?
+        # right now its a hack to skip duplicate constraints on global observables
+        vals = [
+            pdf.log_prob(observables, parameters)
+            for pdf in self.pdfs
+            if pdf.observables & observables
+        ]
+
+        def logp(data, param):
+            return sum(val(data, param) for val in vals)
+
+        return logp
 
 
 @RooWorkspace.register
@@ -48,12 +72,16 @@ class RooCategory(Model):
 
 @RooWorkspace.register
 @dataclass
-class RooProduct(Model):
+class RooProduct(Model, Function):
     components: List[Model]
 
     @classmethod
     def readobj(cls, obj, recursor):
         return cls(components=[recursor(x) for x in obj.components()])
+
+    @property
+    def parameters(self) -> Set[str]:
+        return reduce(set.union, (x.parameters for x in self.components), set())
 
 
 @RooWorkspace.register
@@ -65,24 +93,54 @@ class RooConstVar(Model):
     def readobj(cls, obj, recursor):
         return cls(val=obj.getVal())
 
+    @property
+    def parameters(self):
+        return set()
+
+    def value(self, parameters):
+        return lambda param: self.val
+
 
 @RooWorkspace.register
 @dataclass
-class RooRealSumPdf(Model):
+class RooRealSumPdf(Model, Distribution):
     functions: List[Model]
     coefficients: List[Model]
 
     @classmethod
     def readobj(cls, obj, recursor):
-        return cls(
+        out = cls(
             functions=[recursor(f) for f in obj.funcList()],
             coefficients=[recursor(c) for c in obj.coefList()],
         )
+        # TODO: Is this always true?
+        assert all(isinstance(f, Distribution) for f in out.functions)
+        return out
+
+    @property
+    def observables(self):
+        return reduce(set.union, (x.observables for x in self.functions), set())
+
+    @property
+    def parameters(self) -> Set[str]:
+        fpars = reduce(set.union, (x.parameters for x in self.functions), set())
+        cpars = reduce(set.union, (x.parameters for x in self.coefficients), set())
+        return fpars | cpars
+
+    def log_prob(self, observables: Set[str], parameters: Set[str]):
+        funcs = [f.log_prob(observables, parameters) for f in self.functions]
+        coefs = [c.value(parameters) for c in self.coefficients]
+
+        def logp(data, param):
+            # TODO: normalize by sum(c)?
+            return sum(f(data, param) * c(param) for f, c in zip(funcs, coefs))
+
+        return logp
 
 
 @RooWorkspace.register
 @dataclass
-class RooPoisson(Model):
+class RooPoisson(Model, Distribution):
     x: Model
     mean: Model
 
@@ -90,8 +148,31 @@ class RooPoisson(Model):
     def readobj(cls, obj, recursor):
         # FIXME: in ROOT 6.24 we get proxy accessors (getProxy/numProxies)
         # For now assume servers always in correct order
-        x, mean = obj.servers()
-        return cls(x=recursor(x), mean=recursor(mean))
+        x, mean = map(recursor, obj.servers())
+        return cls(x=x, mean=mean)
+
+    @property
+    def observables(self):
+        return self.x.parameters
+
+    @property
+    def parameters(self) -> Set[str]:
+        return self.mean.parameters
+
+    def log_prob(self, observables: Set[str], parameters: Set[str]):
+        missing = self.parameters - parameters
+        if missing:
+            raise RuntimeError(f"Missing parameters: {missing} in function {self.name}")
+        missing = self.observables - observables
+        if missing:
+            raise RuntimeError(
+                f"Missing observables: {missing} in function {self.name}"
+            )
+
+        def logp(data, param):
+            return stats.poisson.logpmf(data[self.x.name], mu=param[self.mean.name])
+
+        return logp
 
 
 @RooWorkspace.register
@@ -104,31 +185,76 @@ class RooGaussian(Model):
     @classmethod
     def readobj(cls, obj, recursor):
         # FIXME: in ROOT 6.24 we get proxy accessors (getProxy/numProxies)
-        x, mean, sigma = obj.servers()
+        x, mean, sigma = map(recursor, obj.servers())
         return cls(
-            x=recursor(obj.getX()),
-            mean=recursor(obj.getMean()),
-            sigma=recursor(obj.getSigma()),
+            x=x,
+            mean=mean,
+            sigma=sigma,
+        )
+
+    @property
+    def observables(self):
+        return self.x.parameters
+
+    @property
+    def parameters(self) -> Set[str]:
+        return self.mean.parameters | self.sigma.parameters
+
+    def log_prob(self, observables: Set[str], parameters: Set[str]):
+        missing = self.parameters - parameters
+        if missing:
+            raise RuntimeError(f"Missing parameters: {missing} in function {self.name}")
+        missing = self.observables - observables
+        if missing:
+            raise RuntimeError(
+                f"Missing observables: {missing} in function {self.name}"
+            )
+
+        def logp(data, param):
+            return stats.norm.logpdf(
+                data[self.x.name],
+                loc=param[self.mean.name],
+                scale=param[self.sigma.name],
+            )
+
+        return logp
+
+
+@RooWorkspace.register
+@dataclass
+class RooBinning(Model):
+    edges: Array
+
+    @property
+    def n(self):
+        return len(self.edges) - 1
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        n = obj.numBins()
+        return cls(
+            edges=jnp.array([obj.binLow(i) for i in range(n)] + [obj.binHigh(n - 1)])
         )
 
 
-def _parse_binning(binning, recursor):
-    n = binning.numBins()
-    if binning.isUniform():
-        return {
-            "type": "uniform",
-            "edges": jnp.array([binning.lowBound(), binning.highBound()]),
-            "n": n,
-        }
-    elif binning.isParameterized():
-        raise NotImplementedError("RooParamBinning")
-    return {
-        "type": "edges",
-        "edges": jnp.array(
-            [binning.binLow(i) for i in range(n)] + [binning.binHigh(n - 1)]
-        ),
-        "n": n,
-    }
+@RooWorkspace.register
+@dataclass
+class RooUniformBinning(Model):
+    n: int
+    lo: float
+    hi: float
+
+    @property
+    def edges(self):
+        return jnp.linspace(self.lo, self.hi, self.n + 1)
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        return cls(
+            n=obj.numBins(),
+            lo=obj.lowBound(),
+            hi=obj.highBound(),
+        )
 
 
 @RooWorkspace.register
@@ -150,11 +276,23 @@ class RooRealVar(Model):
         )
         bnames = list(obj.getBinningNames())
         if bnames == [""]:
-            out.binning = _parse_binning(obj.getBinning(""), recursor)
+            out.binning = recursor(obj.getBinning(""))
         else:
             # mostly because I don't know the use case
             raise NotImplementedError("Multiple binnings for RooRealVar")
         return out
+
+    @property
+    def parameters(self):
+        return set() if self.const else {self.name}
+
+    def value(self, parameters):
+        if self.const:
+            return lambda param: self.val
+        missing = self.parameters - parameters
+        if missing:
+            raise RuntimeError(f"Missing parameters: {missing} in var {self.name}")
+        return lambda param: param[self.name]
 
 
 @RooWorkspace.register

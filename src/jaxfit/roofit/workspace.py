@@ -27,6 +27,9 @@ class RooWorkspace:
     def __setstate__(self, state):
         self.__dict__.update(state)
 
+    def __getitem__(self, key):
+        return self._out[key]
+
     def getref(self, obj: Any) -> str:
         """
         Get a guaranteed unique name to reference this object by
@@ -45,7 +48,7 @@ class RooWorkspace:
                     if o is obj:
                         return f"{name};{i+1}"
                 cand.append(obj)
-                return f"{name};{i+1}"
+                return f"{name};{len(cand)}"
             else:
                 self._inputobj[name] = [cand]
                 return name

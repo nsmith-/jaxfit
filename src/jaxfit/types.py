@@ -40,23 +40,22 @@ SolverFunction = Callable[
 class Distribution(Protocol):
     @property
     def parameters(self) -> Set[str]:
-        ...
+        raise NotImplementedError
 
     @property
     def observables(self) -> Set[str]:
-        ...
+        raise NotImplementedError
 
     def log_prob(
         self, observables: Set[str], parameters: Set[str]
     ) -> Callable[[DTree, DTree], TracerOrArray]:
-        ...
+        """Get the statistical model function
 
-    """Get the statistical model function
-
-    i.e. ln f(x,theta), which can either be interepreted as
-    - ln P(x|theta), the probability of x given theta; or
-    - ln L(theta|x), the likelihood of theta given observation x
-    """
+        i.e. ln f(x,theta), which can either be interepreted as
+        - ln P(x|theta), the probability of x given theta; or
+        - ln L(theta|x), the likelihood of theta given observation x
+        """
+        raise NotImplementedError
 
     # TODO: def sample(self, rng, observables, parameters, asimov=False)
 
@@ -64,7 +63,7 @@ class Distribution(Protocol):
 @runtime_checkable
 class Function(Protocol):
     def parameters(self) -> Set[str]:
-        ...
+        raise NotImplementedError
 
     def value(self, parameters: Set[str]) -> Callable[[DTree], TracerOrArray]:
-        ...
+        raise NotImplementedError
