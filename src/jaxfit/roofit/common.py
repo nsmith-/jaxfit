@@ -2,7 +2,7 @@
 """
 from dataclasses import dataclass
 from functools import reduce
-from typing import Any, List, Set
+from typing import List, Set
 
 import jax.numpy as jnp
 import jax.scipy.stats as stats
@@ -264,22 +264,24 @@ class RooRealVar(Model):
     min: float
     max: float
     const: bool
-    binning: Any = None  # FIXME: proper classes
+    binning: Model
 
     @classmethod
     def readobj(cls, obj, recursor):
+        bnames = list(obj.getBinningNames())
+        if bnames == [""]:
+            binning = recursor(obj.getBinning(""))
+        else:
+            # mostly because I don't know the use case
+            raise NotImplementedError("No or multiple binnings for RooRealVar")
+        # TODO: why do all vars have a binning? how to tell default from real?
         out = cls(
             val=obj.getVal(),
             min=obj.getMin(),
             max=obj.getMax(),
             const=obj.getAttribute("Constant"),
+            binning=binning,
         )
-        bnames = list(obj.getBinningNames())
-        if bnames == [""]:
-            out.binning = recursor(obj.getBinning(""))
-        else:
-            # mostly because I don't know the use case
-            raise NotImplementedError("Multiple binnings for RooRealVar")
         return out
 
     @property

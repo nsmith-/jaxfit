@@ -94,7 +94,7 @@ class ProcessNormalization(Model, Function):
 
     @classmethod
     def readobj(cls, obj, recursor):
-        asympar = [[lo, hi] for lo, hi in obj.getAsymLogKappa()]
+        asympar = [[-lo, hi] for lo, hi in obj.getAsymLogKappa()]
         return cls(
             nominal=obj.getNominalValue(),
             symParams=[recursor(p) for p in obj.getSymErrorParameters()],
@@ -124,7 +124,7 @@ class ProcessNormalization(Model, Function):
             asymTheta = jnp.array([param[p.name] for p in self.asymParams])
             asymShift = jnp.sum(
                 _asym_interpolation(
-                    asymTheta, self.asymLogKappaLo, self.asymLogKappaHi
+                    asymTheta, self.asymLogKappaHi, self.asymLogKappaLo
                 ),
                 axis=-1,
             )
@@ -143,11 +143,11 @@ def _bbparse(obj, functions, recursor):
         if len(bintype) == 1 and bintype[0] == 0:
             # No MC stat
             bbpars.append([0.0] * len(functions))
-            bbscale.append([0.0] * len(functions))
+            bbscale.append([-2.0] * len(functions))
         elif len(bintype) == 1 and bintype[0] == 1:
             # BB-lite (single gaussian)
             bbpars.append([next(pariter)] + [0.0] * (nch - 1))
-            bbscale.append([-1.0] + [0.0] * (nch - 1))
+            bbscale.append([-1.0] + [-2.0] * (nch - 1))
         else:
             procpar = []
             procscale = []
@@ -173,7 +173,7 @@ def _bbparse(obj, functions, recursor):
                 else:
                     # This process doesn't contribute
                     procpar.append(0.0)
-                    procscale.append(0.0)
+                    procscale.append(-2.0)
             bbpars.append(procpar)
             bbscale.append(procscale)
 
@@ -242,7 +242,7 @@ class CMSHistErrorPropagator(Model, Distribution):
             for f, c in zip(self.functions, self.coefficients)
         ]
         bb_errors = jnp.array([f.bberrors for f in self.functions]).T
-        bblite_errors = jnp.sqrt(jnp.sum(bb_errors ** 2, axis=0))
+        bblite_errors = jnp.sqrt(jnp.sum(bb_errors ** 2, axis=1))
 
         def logp(data, param):
             if len(data["weight"]) != len(self.bbpars):
@@ -264,7 +264,9 @@ class CMSHistErrorPropagator(Model, Distribution):
                 jnp.where(
                     self.bbscale == 0.0,
                     bb_errors * bbparams,
-                    jnp.where(self.bbscale == -1.0, bblite_errors * bbparams, 0.0),
+                    jnp.where(
+                        self.bbscale == -1.0, bblite_errors[:, None] * bbparams, 0.0
+                    ),
                 ),
             )
             expected = jnp.sum(expected_perchannel, axis=1)
@@ -284,8 +286,9 @@ class CMSHistErrorPropagator(Model, Distribution):
 class CMSHistFunc(Model, Function):
     x: Model
     verticalParams: List[Model]
-    verticalMorphsLo: Array  # 2d: (bin, param)
-    verticalMorphsHi: Array  # 2d: (bin, param)
+    verticalMorphsLo: Array  # 2d: (param, bin)
+    verticalMorphsHi: Array  # 2d: (param, bin)
+    verticalType: int
     bberrors: Array  # 1d
     nominal: Array  # 1d
 
@@ -304,8 +307,9 @@ class CMSHistFunc(Model, Function):
         return cls(
             x=recursor(obj.getXVar()),
             verticalParams=[m["param"] for m in morphs],
-            verticalMorphsLo=jnp.array([m["lo"] for m in morphs]).T,
-            verticalMorphsHi=jnp.array([m["hi"] for m in morphs]).T,
+            verticalMorphsLo=jnp.array([m["lo"] for m in morphs]),
+            verticalMorphsHi=jnp.array([m["hi"] for m in morphs]),
+            verticalType=obj.getVerticalType(),
             bberrors=_fasthisto2array(obj.errors()),
             nominal=_fasthisto2array(obj.getShape(0, 0, 0, 0)),
         )
@@ -319,15 +323,28 @@ class CMSHistFunc(Model, Function):
         if missing:
             raise RuntimeError(f"Missing parameters: {missing} in function {self.name}")
 
+        if not len(self.verticalParams):
+            return lambda param: self.nominal
+
         def val(param):
             vertp = jnp.array([param[p.name] for p in self.verticalParams])
-            # TODO: log kappa. vs delta
-            return self.nominal + jnp.sum(
-                _asym_interpolation(
-                    vertp, self.verticalMorphsLo, self.verticalMorphsHi
-                ),
-                axis=-1,
-            )
+            if self.verticalType == 0:
+                # QuadLinear
+                vshift = _asym_interpolation(
+                    vertp,
+                    self.verticalMorphsHi - self.nominal,
+                    self.verticalMorphsLo - self.nominal,
+                )
+                # TODO: why 3x!!
+                return self.nominal + 3 * jnp.sum(vshift, axis=0)
+            elif self.verticalType == 1:
+                # LogQuadLinear
+                vshift = _asym_interpolation(
+                    vertp,
+                    jnp.log(self.verticalMorphsHi / self.nominal),
+                    jnp.log(self.verticalMorphsLo / self.nominal),
+                )
+                return self.nominal * jnp.exp(jnp.sum(vshift, axis=0))
 
         return val
 
