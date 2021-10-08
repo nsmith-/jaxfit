@@ -42,8 +42,19 @@ def _asdict(obj):
 
 @dataclass
 class Model:
-    # The name is set by the containing RooWorkspace
-    # name: str = None
+    @property
+    def name(self):
+        try:
+            return self._name
+        except AttributeError:
+            self._name = f"{type(self).__name__}:anon{id(self):x}"
+            return self._name
+
+    @name.setter
+    def name(self, name):
+        if hasattr(self, "_name"):
+            raise RuntimeError(f"Object already named! {self.name}")
+        self._name = name
 
     def to_dict(self):
         return {k.name: _asdict(getattr(self, k.name)) for k in fields(self)}

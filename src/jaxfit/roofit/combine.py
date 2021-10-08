@@ -7,7 +7,14 @@ from typing import Dict, List, Set, Union
 import jax.numpy as jnp
 import jax.scipy.stats as stats
 
-from jaxfit.roofit.common import RooCategory, RooConstVar, RooGaussian, RooProduct
+from jaxfit.roofit.common import (
+    RooCategory,
+    RooConstVar,
+    RooGaussian,
+    RooPoisson,
+    RooProdPdf,
+    RooProduct,
+)
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
 from jaxfit.types import Array, Distribution, Function
@@ -15,6 +22,14 @@ from jaxfit.types import Array, Distribution, Function
 
 def _fasthisto2array(h):
     return jnp.array([h[i] for i in range(h.size())])
+
+
+def _factorize(pdf):
+    if isinstance(pdf, RooProdPdf):
+        for p in pdf.pdfs:
+            yield from _factorize(p)
+    else:
+        yield pdf
 
 
 @RooWorkspace.register
@@ -47,16 +62,88 @@ class RooSimultaneousOpt(Model, Distribution):
         return reduce(set.union, (pdf.parameters for pdf in self.pdfs.values()), set())
 
     def log_prob(self, observables: Set[str], parameters: Set[str]):
-        vals = []
-        for pdf in self.pdfs.values():
-            vals.append(pdf.log_prob(observables, parameters))
-            # FIXME: combine-specific hack to identify global observables (prevent double-fitting)
-            observables = observables - {
-                var for var in pdf.observables if var.endswith("_In")
-            }
+        """Combine-specific log_prob
+
+        We can do more optimization because we expect a certain structure, based on
+        how combine builds the RooFit model.
+        """
+        generic = {}
+        gaus_constr = {}
+        pois_constr = {}
+        for cat, catp in self.pdfs.items():
+            for pdf in _factorize(catp):
+                obs = list(pdf.observables)
+                if len(obs) != 1:
+                    raise RuntimeError(
+                        f"Unfactorized pdf: {pdf.name}, observables {obs}"
+                    )
+                obs = obs[0]
+                if isinstance(pdf, RooGaussian):
+                    if not obs.endswith("_In"):
+                        raise RuntimeError(
+                            f"Expected {pdf.name} to have a global observable-like name, instead have {obs}"
+                        )
+                    if obs in gaus_constr:
+                        # check same constraint?
+                        continue
+                    if not (pdf.mean.name in parameters or pdf.mean.const):
+                        raise RuntimeError(
+                            f"Constraint depends on non-const missing parameter {pdf.mean.name}"
+                        )
+                    if not (pdf.sigma.name in parameters or pdf.sigma.const):
+                        raise RuntimeError(
+                            f"Constraint depends on non-const missing parameter {pdf.sigma.name}"
+                        )
+                    gaus_constr[obs] = (
+                        pdf.mean.val if pdf.mean.const else pdf.mean.name,
+                        pdf.sigma.val if pdf.sigma.const else pdf.sigma.name,
+                    )
+                elif isinstance(pdf, RooPoisson):
+                    if not obs.endswith("_In"):
+                        raise RuntimeError(
+                            f"Expected {pdf.name} to have a global observable-like name, instead have {obs}"
+                        )
+                    if obs in pois_constr:
+                        # check same constraint?
+                        continue
+                    if not (pdf.mean.name in parameters or pdf.mean.const):
+                        raise RuntimeError(
+                            f"Constraint depends on non-const missing parameter {pdf.mean.name}"
+                        )
+                    pois_constr[obs] = pdf.mean.val if pdf.mean.const else pdf.mean.name
+                else:
+                    # this pdf has observables that may depend on cat
+                    # and anyway we delegate construction to it
+                    # probably better to fix combine structure in the beginning..
+                    if cat in generic:
+                        raise RuntimeError("did we over-factorize?")
+                    generic[cat] = pdf.log_prob(observables, parameters)
 
         def logp(data, param):
-            return sum(val(data[cat], param) for cat, val in zip(self.pdfs, vals))
+            gausx = jnp.array([data[p] for p in gaus_constr])
+            gausm = jnp.array(
+                [
+                    p if isinstance(p, float) else param[p]
+                    for p, _ in gaus_constr.values()
+                ]
+            )
+            gauss = jnp.array(
+                [
+                    p if isinstance(p, float) else param[p]
+                    for _, p in gaus_constr.values()
+                ]
+            )
+            gaus_prob = stats.norm.logpdf(gausx, loc=gausm, scale=gauss)
+            poisx = jnp.array([data[p] for p in pois_constr])
+            poism = jnp.array(
+                [p if isinstance(p, float) else param[p] for p in pois_constr.values()]
+            )
+            pois_prob = stats.poisson.logpmf(poisx, mu=poism)
+            return (
+                sum(generic[cat](data[cat], param) for cat in self.pdfs)
+                + jnp.sum(gaus_prob)
+                + jnp.sum(pois_prob)
+            )
 
         return logp
 

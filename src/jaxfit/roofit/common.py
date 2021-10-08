@@ -44,13 +44,7 @@ class RooProdPdf(Model, Distribution):
         return reduce(set.union, (pdf.parameters for pdf in self.pdfs), set())
 
     def log_prob(self, observables: Set[str], parameters: Set[str]):
-        # TODO: we don't really want to skip pdfs with missing observables?
-        # right now its a hack to skip duplicate constraints on global observables
-        vals = [
-            pdf.log_prob(observables, parameters)
-            for pdf in self.pdfs
-            if pdf.observables & observables
-        ]
+        vals = [pdf.log_prob(observables, parameters) for pdf in self.pdfs]
 
         def logp(data, param):
             return sum(val(data, param) for val in vals)
@@ -94,8 +88,16 @@ class RooConstVar(Model):
         return cls(val=obj.getVal())
 
     @property
+    def observables(self):
+        return {self.name}
+
+    @property
     def parameters(self):
         return set()
+
+    @property
+    def const(self):
+        return True
 
     def value(self, parameters):
         return lambda param: self.val
@@ -153,7 +155,7 @@ class RooPoisson(Model, Distribution):
 
     @property
     def observables(self):
-        return self.x.parameters
+        return self.x.observables
 
     @property
     def parameters(self) -> Set[str]:
@@ -194,7 +196,7 @@ class RooGaussian(Model):
 
     @property
     def observables(self):
-        return self.x.parameters
+        return self.x.observables
 
     @property
     def parameters(self) -> Set[str]:
@@ -285,8 +287,33 @@ class RooRealVar(Model):
         return out
 
     @property
+    def observables(self):
+        return {self.name}
+
+    @property
     def parameters(self):
         return set() if self.const else {self.name}
+
+    def value(self, parameters):
+        if self.const:
+            return lambda param: self.val
+        missing = self.parameters - parameters
+        if missing:
+            raise RuntimeError(f"Missing parameters: {missing} in var {self.name}")
+        return lambda param: param[self.name]
+
+
+@RooWorkspace.register
+@dataclass
+class _Vectorized_RooRealVar(Model):
+    val: Array
+    min: Array
+    max: Array
+    const: bool
+
+    @property
+    def parameters(self):
+        return {self.name}
 
     def value(self, parameters):
         if self.const:
