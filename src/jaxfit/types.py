@@ -67,3 +67,13 @@ class Function(Protocol):
 
     def value(self, parameters: Set[str]) -> Callable[[DTree], TracerOrArray]:
         raise NotImplementedError
+
+
+@runtime_checkable
+class Parameter(Protocol):
+    @property
+    def name(self):
+        raise NotImplementedError
+
+    def value(self, parameters: Set[str]) -> Callable[[DTree], TracerOrArray]:
+        raise NotImplementedError

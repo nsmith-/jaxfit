@@ -2,15 +2,15 @@
 """
 from dataclasses import dataclass
 from functools import reduce
-from typing import List, Set
+from typing import List
 
 import jax.numpy as jnp
 import jax.scipy.stats as stats
 
-from jaxfit.roofit._util import _importROOT
+from jaxfit.roofit._util import DataSlice, ParameterPack, _importROOT
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
-from jaxfit.types import Array, Distribution, Function
+from jaxfit.types import Array, Distribution, Function, Parameter
 
 
 @RooWorkspace.register
@@ -40,10 +40,10 @@ class RooProdPdf(Model, Distribution):
         return reduce(set.union, (pdf.observables for pdf in self.pdfs), set())
 
     @property
-    def parameters(self) -> Set[str]:
+    def parameters(self):
         return reduce(set.union, (pdf.parameters for pdf in self.pdfs), set())
 
-    def log_prob(self, observables: Set[str], parameters: Set[str]):
+    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
         vals = [pdf.log_prob(observables, parameters) for pdf in self.pdfs]
 
         def logp(data, param):
@@ -74,33 +74,8 @@ class RooProduct(Model, Function):
         return cls(components=[recursor(x) for x in obj.components()])
 
     @property
-    def parameters(self) -> Set[str]:
-        return reduce(set.union, (x.parameters for x in self.components), set())
-
-
-@RooWorkspace.register
-@dataclass
-class RooConstVar(Model):
-    val: float
-
-    @classmethod
-    def readobj(cls, obj, recursor):
-        return cls(val=obj.getVal())
-
-    @property
-    def observables(self):
-        return {self.name}
-
-    @property
     def parameters(self):
-        return set()
-
-    @property
-    def const(self):
-        return True
-
-    def value(self, parameters):
-        return lambda param: self.val
+        return reduce(set.union, (x.parameters for x in self.components), set())
 
 
 @RooWorkspace.register
@@ -124,12 +99,12 @@ class RooRealSumPdf(Model, Distribution):
         return reduce(set.union, (x.observables for x in self.functions), set())
 
     @property
-    def parameters(self) -> Set[str]:
+    def parameters(self):
         fpars = reduce(set.union, (x.parameters for x in self.functions), set())
         cpars = reduce(set.union, (x.parameters for x in self.coefficients), set())
         return fpars | cpars
 
-    def log_prob(self, observables: Set[str], parameters: Set[str]):
+    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
         funcs = [f.log_prob(observables, parameters) for f in self.functions]
         coefs = [c.value(parameters) for c in self.coefficients]
 
@@ -158,21 +133,15 @@ class RooPoisson(Model, Distribution):
         return self.x.observables
 
     @property
-    def parameters(self) -> Set[str]:
+    def parameters(self):
         return self.mean.parameters
 
-    def log_prob(self, observables: Set[str], parameters: Set[str]):
-        missing = self.parameters - parameters
-        if missing:
-            raise RuntimeError(f"Missing parameters: {missing} in function {self.name}")
-        missing = self.observables - observables
-        if missing:
-            raise RuntimeError(
-                f"Missing observables: {missing} in function {self.name}"
-            )
+    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+        x = observables.arrayof([self.x.name])
+        mu = parameters.arrayof([self.mean.name])
 
         def logp(data, param):
-            return stats.poisson.logpmf(data[self.x.name], mu=param[self.mean.name])
+            return stats.poisson.logpmf(x(data), mu=mu(param))
 
         return logp
 
@@ -199,24 +168,19 @@ class RooGaussian(Model):
         return self.x.observables
 
     @property
-    def parameters(self) -> Set[str]:
+    def parameters(self):
         return self.mean.parameters | self.sigma.parameters
 
-    def log_prob(self, observables: Set[str], parameters: Set[str]):
-        missing = self.parameters - parameters
-        if missing:
-            raise RuntimeError(f"Missing parameters: {missing} in function {self.name}")
-        missing = self.observables - observables
-        if missing:
-            raise RuntimeError(
-                f"Missing observables: {missing} in function {self.name}"
-            )
+    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+        x = observables.arrayof([self.x.name])
+        loc = parameters.arrayof([self.mean.name])
+        scale = parameters.arrayof([self.sigma.name])
 
         def logp(data, param):
             return stats.norm.logpdf(
-                data[self.x.name],
-                loc=param[self.mean.name],
-                scale=param[self.sigma.name],
+                x(data),
+                loc=loc(param),
+                scale=scale(param),
             )
 
         return logp
@@ -261,7 +225,7 @@ class RooUniformBinning(Model):
 
 @RooWorkspace.register
 @dataclass
-class RooRealVar(Model):
+class RooRealVar(Model, Parameter):
     val: float
     min: float
     max: float
@@ -297,31 +261,33 @@ class RooRealVar(Model):
     def value(self, parameters):
         if self.const:
             return lambda param: self.val
-        missing = self.parameters - parameters
-        if missing:
-            raise RuntimeError(f"Missing parameters: {missing} in var {self.name}")
-        return lambda param: param[self.name]
+
+        return parameters.arrayof([self.name])
 
 
 @RooWorkspace.register
 @dataclass
-class _Vectorized_RooRealVar(Model):
-    val: Array
-    min: Array
-    max: Array
-    const: bool
+class RooConstVar(Model, Parameter):
+    val: float
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        return cls(val=obj.getVal())
+
+    @property
+    def observables(self):
+        return {self.name}
 
     @property
     def parameters(self):
-        return {self.name}
+        return set()
+
+    @property
+    def const(self):
+        return True
 
     def value(self, parameters):
-        if self.const:
-            return lambda param: self.val
-        missing = self.parameters - parameters
-        if missing:
-            raise RuntimeError(f"Missing parameters: {missing} in var {self.name}")
-        return lambda param: param[self.name]
+        return lambda param: self.val
 
 
 @RooWorkspace.register

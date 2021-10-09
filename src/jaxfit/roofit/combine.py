@@ -2,11 +2,12 @@
 """
 from dataclasses import dataclass
 from functools import reduce
-from typing import Dict, List, Set, Union
+from typing import Dict, List, Union
 
 import jax.numpy as jnp
 import jax.scipy.stats as stats
 
+from jaxfit.roofit._util import DataPack, DataSlice, ParameterPack
 from jaxfit.roofit.common import (
     RooCategory,
     RooConstVar,
@@ -58,10 +59,10 @@ class RooSimultaneousOpt(Model, Distribution):
         return out | {self.indexCat.name}
 
     @property
-    def parameters(self) -> Set[str]:
+    def parameters(self):
         return reduce(set.union, (pdf.parameters for pdf in self.pdfs.values()), set())
 
-    def log_prob(self, observables: Set[str], parameters: Set[str]):
+    def log_prob(self, observables: DataPack, parameters: ParameterPack):
         """Combine-specific log_prob
 
         We can do more optimization because we expect a certain structure, based on
@@ -86,14 +87,6 @@ class RooSimultaneousOpt(Model, Distribution):
                     if obs in gaus_constr:
                         # check same constraint?
                         continue
-                    if not (pdf.mean.name in parameters or pdf.mean.const):
-                        raise RuntimeError(
-                            f"Constraint depends on non-const missing parameter {pdf.mean.name}"
-                        )
-                    if not (pdf.sigma.name in parameters or pdf.sigma.const):
-                        raise RuntimeError(
-                            f"Constraint depends on non-const missing parameter {pdf.sigma.name}"
-                        )
                     gaus_constr[obs] = (
                         pdf.mean.val if pdf.mean.const else pdf.mean.name,
                         pdf.sigma.val if pdf.sigma.const else pdf.sigma.name,
@@ -106,10 +99,6 @@ class RooSimultaneousOpt(Model, Distribution):
                     if obs in pois_constr:
                         # check same constraint?
                         continue
-                    if not (pdf.mean.name in parameters or pdf.mean.const):
-                        raise RuntimeError(
-                            f"Constraint depends on non-const missing parameter {pdf.mean.name}"
-                        )
                     pois_constr[obs] = pdf.mean.val if pdf.mean.const else pdf.mean.name
                 else:
                     # this pdf has observables that may depend on cat
@@ -117,30 +106,21 @@ class RooSimultaneousOpt(Model, Distribution):
                     # probably better to fix combine structure in the beginning..
                     if cat in generic:
                         raise RuntimeError("did we over-factorize?")
-                    generic[cat] = pdf.log_prob(observables, parameters)
+                    generic[cat] = pdf.log_prob(observables.slice(cat), parameters)
+
+        gausx = observables.arrayof([p for p in gaus_constr])
+        gausm = parameters.arrayof([p for p, _ in gaus_constr.values()])
+        gauss = parameters.arrayof([p for _, p in gaus_constr.values()])
+        poisx = observables.arrayof([p for p in pois_constr])
+        poism = parameters.arrayof(list(pois_constr.values()))
 
         def logp(data, param):
-            gausx = jnp.array([data[p] for p in gaus_constr])
-            gausm = jnp.array(
-                [
-                    p if isinstance(p, float) else param[p]
-                    for p, _ in gaus_constr.values()
-                ]
+            gaus_prob = stats.norm.logpdf(
+                gausx(data), loc=gausm(param), scale=gauss(param)
             )
-            gauss = jnp.array(
-                [
-                    p if isinstance(p, float) else param[p]
-                    for _, p in gaus_constr.values()
-                ]
-            )
-            gaus_prob = stats.norm.logpdf(gausx, loc=gausm, scale=gauss)
-            poisx = jnp.array([data[p] for p in pois_constr])
-            poism = jnp.array(
-                [p if isinstance(p, float) else param[p] for p in pois_constr.values()]
-            )
-            pois_prob = stats.poisson.logpmf(poisx, mu=poism)
+            pois_prob = stats.poisson.logpmf(poisx(data), mu=poism(param))
             return (
-                sum(generic[cat](data[cat], param) for cat in self.pdfs)
+                sum(generic[cat](data, param) for cat in self.pdfs)
                 + jnp.sum(gaus_prob)
                 + jnp.sum(pois_prob)
             )
@@ -200,22 +180,20 @@ class ProcessNormalization(Model, Function):
             set(),
         )
 
-    def value(self, parameters):
-        missing = self.parameters - parameters
-        if missing:
-            raise RuntimeError(f"Missing parameters: {missing} in function {self.name}")
+    def value(self, parameters: ParameterPack):
+        symTheta = parameters.arrayof([p.name for p in self.symParams])
+        asymTheta = parameters.arrayof([p.name for p in self.asymParams])
+        addParam = parameters.arrayof([p.name for p in self.additional])
 
         def val(param):
-            symTheta = jnp.array([param[p.name] for p in self.symParams])
-            symShift = jnp.sum(self.symLogKappa * symTheta, axis=-1)
-            asymTheta = jnp.array([param[p.name] for p in self.asymParams])
+            symShift = jnp.sum(self.symLogKappa * symTheta(param), axis=-1)
             asymShift = jnp.sum(
                 _asym_interpolation(
-                    asymTheta, self.asymLogKappaHi, self.asymLogKappaLo
+                    asymTheta(param), self.asymLogKappaHi, self.asymLogKappaLo
                 ),
                 axis=-1,
             )
-            addFactor = jnp.prod(jnp.array([param[p.name] for p in self.additional]))
+            addFactor = jnp.prod(addParam(param))
             return self.nominal * jnp.exp(symShift + asymShift) * addFactor
 
         return val
@@ -316,44 +294,34 @@ class CMSHistErrorPropagator(Model, Distribution):
         )
         return fpars | cpars | bpars
 
-    def log_prob(self, observables: Set[str], parameters: Set[str]):
-        missing = self.parameters - parameters
-        if missing:
-            raise RuntimeError(f"Missing parameters: {missing} in pdf {self.name}")
-        missing = self.observables - observables
-        if missing:
-            raise RuntimeError(f"Missing observables: {missing} in pdf {self.name}")
-
+    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
         chvals = [
             (f.value(parameters), c.value(parameters))
             for f, c in zip(self.functions, self.coefficients)
         ]
         bb_errors = jnp.array([f.bberrors for f in self.functions]).T
         bblite_errors = jnp.sqrt(jnp.sum(bb_errors ** 2, axis=1))
+        bbparams = parameters.arrayof(
+            [
+                p if isinstance(p, float) else p.name
+                for procpars in self.bbpars
+                for p in procpars
+            ]
+        )
+        get_observed = observables.arrayof(self.x.binning.edges)
 
         def logp(data, param):
-            if len(data["weight"]) != len(self.bbpars):
-                # FIXME: would be better to make a binned data indicator?
-                # in principle we can do a binned fit to unbinned data via jnp.searchsorted, jnp.bincount
-                raise RuntimeError("not correctly binned data?")
-            observed = data["weight"]
+            observed = get_observed(data)
             expected_perchannel = jnp.array([f(param) * c(param) for f, c in chvals]).T
             # here we can do analytic Balow-Beeston in principle
-            bbparams = jnp.array(
-                [
-                    [p if isinstance(p, float) else param[p.name] for p in procpars]
-                    for procpars in self.bbpars
-                ]
-            )
+            bb = bbparams(param).reshape(self.bbscale.shape)
             expected_perchannel = expected_perchannel + jnp.where(
                 self.bbscale > 0.0,
-                (bbparams * self.bbscale - 1) * expected_perchannel,
+                (bb * self.bbscale - 1) * expected_perchannel,
                 jnp.where(
                     self.bbscale == 0.0,
-                    bb_errors * bbparams,
-                    jnp.where(
-                        self.bbscale == -1.0, bblite_errors[:, None] * bbparams, 0.0
-                    ),
+                    bb_errors * bb,
+                    jnp.where(self.bbscale == -1.0, bblite_errors[:, None] * bb, 0.0),
                 ),
             )
             expected = jnp.sum(expected_perchannel, axis=1)
@@ -405,20 +373,17 @@ class CMSHistFunc(Model, Function):
     def parameters(self):
         return reduce(set.union, (p.parameters for p in self.verticalParams), set())
 
-    def value(self, parameters):
-        missing = self.parameters - parameters
-        if missing:
-            raise RuntimeError(f"Missing parameters: {missing} in function {self.name}")
-
+    def value(self, parameters: ParameterPack):
         if not len(self.verticalParams):
             return lambda param: self.nominal
 
+        vertp = parameters.arrayof([p.name for p in self.verticalParams])
+
         def val(param):
-            vertp = jnp.array([param[p.name] for p in self.verticalParams])
             if self.verticalType == 0:
                 # QuadLinear
                 vshift = _asym_interpolation(
-                    vertp,
+                    vertp(param),
                     self.verticalMorphsHi - self.nominal,
                     self.verticalMorphsLo - self.nominal,
                 )
