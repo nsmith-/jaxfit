@@ -1,8 +1,10 @@
 """Built-in RooFit objects
 """
+import itertools
+import operator
 from dataclasses import dataclass
 from functools import reduce
-from typing import List
+from typing import Dict, Iterable, List, Tuple
 
 import jax.numpy as jnp
 import jax.scipy.stats as stats
@@ -20,6 +22,9 @@ class _Unknown(Model):
 
     @classmethod
     def readobj(cls, obj, recursor):
+        import pdb
+
+        pdb.set_trace()
         return cls(children=[recursor(child) for child in obj.servers()])
 
 
@@ -76,6 +81,12 @@ class RooProduct(Model, Function):
     @property
     def parameters(self):
         return reduce(set.union, (x.parameters for x in self.components), set())
+
+    def value(self, parameters):
+        # if all(isinstance(c, RooRealVar) for c in self.components):
+        #   TODO: vectorize
+        vals = [c.value(parameters) for c in self.components]
+        return lambda param: reduce(operator.mul, (v(param) for v in vals), 1.0)
 
 
 @RooWorkspace.register
@@ -235,11 +246,13 @@ class RooRealVar(Model, Parameter):
     @classmethod
     def readobj(cls, obj, recursor):
         bnames = list(obj.getBinningNames())
-        if bnames == [""]:
+        if "" in bnames:
             binning = recursor(obj.getBinning(""))
         else:
             # mostly because I don't know the use case
-            raise NotImplementedError("No or multiple binnings for RooRealVar")
+            raise NotImplementedError(
+                f"No or multiple binnings for {obj.GetName()}: {bnames}"
+            )
         # TODO: why do all vars have a binning? how to tell default from real?
         out = cls(
             val=obj.getVal(),
@@ -294,8 +307,7 @@ class RooConstVar(Model, Parameter):
 @dataclass
 class RooDataSet(Model):
     observables: List[Model]
-    points: Array  # 2d
-    weights: Array = None  # 1d
+    points: List[Array]  # 1-d
 
     @classmethod
     def readobj(cls, obj, recursor):
@@ -303,13 +315,37 @@ class RooDataSet(Model):
         data = obj.store()
         if not isinstance(data, ROOT.RooVectorDataStore):
             raise NotImplementedError("Non-memory data stores")
+
+        observables = [recursor(p) for p in data.row()]
+        if not observables[-1].name.endswith("_weight_"):
+            raise RuntimeError(
+                f"Data without a weight observable? isWeighted: {data.isWeighted()}"
+            )
+        if sum(isinstance(p, RooCategory) for p in observables) > 1:
+            raise NotImplementedError(
+                "Have not confirmed multi-category datasets ordering"
+            )
+        if sum(isinstance(p, RooRealVar) for p in observables) > 2:
+            raise NotImplementedError("Have not implemented multi-dimensional pdfs")
+        points = [jnp.array(list(val)) for val in data.getBatch(0, data.size())]
         out = cls(
-            observables=[recursor(p) for p in data.row()],
-            points=jnp.array([list(p) for p in data.getBatch(0, data.size())]),
+            observables=observables,
+            points=points,
         )
-        if data.isWeighted():
-            # if w2 == w we can assume, at least for combine, that this is binned poisson (or asimov)
-            # check that data = bin centers
-            # if w2 != w we might need to do some apprixmation a la RooFit.SumW2Error(True) minimizer option
-            out.weights = jnp.array(list(data.getWeightBatch(0, data.size())))
         return out
+
+    def categories(self) -> Iterable[Tuple[str]]:
+        return itertools.product(
+            *(p.labels for p in self.observables if isinstance(p, RooCategory))
+        )
+
+    def columns(self) -> Iterable[str]:
+        return (p.name for p in self.observables if isinstance(p, RooRealVar))
+
+    def __getitem__(self, col: str) -> Dict[Tuple[str], Array]:
+        catkeys = list(self.categories())
+        for c, v in zip(self.columns(), self.points):
+            v = v.reshape(len(catkeys), -1)
+            if c == col:
+                return {k: v[i] for i, k in enumerate(catkeys)}
+        raise KeyError(col)

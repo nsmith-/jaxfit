@@ -1,5 +1,6 @@
 """Custom RooFit objects found in CMS combine
 """
+import operator
 from dataclasses import dataclass
 from functools import reduce
 from typing import Dict, List, Union
@@ -15,6 +16,7 @@ from jaxfit.roofit.common import (
     RooPoisson,
     RooProdPdf,
     RooProduct,
+    RooRealVar,
 )
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
@@ -25,12 +27,23 @@ def _fasthisto2array(h):
     return jnp.array([h[i] for i in range(h.size())])
 
 
-def _factorize(pdf):
+def _factorize_prodpdf(pdf):
     if isinstance(pdf, RooProdPdf):
         for p in pdf.pdfs:
-            yield from _factorize(p)
+            yield from _factorize_prodpdf(p)
     else:
         yield pdf
+
+
+def _factorize_prod(fcn):
+    if isinstance(fcn, list):
+        for p in fcn:
+            yield from _factorize_prod(p)
+    elif isinstance(fcn, RooProduct):
+        for p in fcn.components:
+            yield from _factorize_prod(p)
+    else:
+        yield fcn
 
 
 @RooWorkspace.register
@@ -72,7 +85,7 @@ class RooSimultaneousOpt(Model, Distribution):
         gaus_constr = {}
         pois_constr = {}
         for cat, catp in self.pdfs.items():
-            for pdf in _factorize(catp):
+            for pdf in _factorize_prodpdf(catp):
                 obs = list(pdf.observables)
                 if len(obs) != 1:
                     raise RuntimeError(
@@ -183,7 +196,14 @@ class ProcessNormalization(Model, Function):
     def value(self, parameters: ParameterPack):
         symTheta = parameters.arrayof([p.name for p in self.symParams])
         asymTheta = parameters.arrayof([p.name for p in self.asymParams])
-        addParam = parameters.arrayof([p.name for p in self.additional])
+        addParam = list(_factorize_prod(self.additional))
+        canVectorizeAddParam = all(isinstance(p, RooRealVar) for p in addParam)
+        if canVectorizeAddParam:
+            addParam = parameters.arrayof(
+                [p.val if p.const else p.name for p in addParam]
+            )
+        else:
+            addParam = [p.value(parameters) for p in addParam]
 
         def val(param):
             symShift = jnp.sum(self.symLogKappa * symTheta(param), axis=-1)
@@ -193,7 +213,10 @@ class ProcessNormalization(Model, Function):
                 ),
                 axis=-1,
             )
-            addFactor = jnp.prod(addParam(param))
+            if canVectorizeAddParam:
+                addFactor = jnp.prod(addParam(param))
+            else:
+                addFactor = reduce(operator.mul, (p(param) for p in addParam), 1.0)
             return self.nominal * jnp.exp(symShift + asymShift) * addFactor
 
         return val
@@ -271,7 +294,6 @@ class CMSHistErrorPropagator(Model, Distribution):
             isinstance(x, ProcessNormalization) or x.name == "RooRealVar:ZERO"
             for x in out.coefficients
         )
-        assert len(out.bbpars) == out.x.binning.n
         return out
 
     @property
@@ -308,7 +330,8 @@ class CMSHistErrorPropagator(Model, Distribution):
                 for p in procpars
             ]
         )
-        get_observed = observables.arrayof(self.x.binning.edges)
+        # TODO: still can't figure out how combine ensures correct binning
+        get_observed = observables.arrayof(self.x.binning.edges[: len(self.bbpars) + 1])
 
         def logp(data, param):
             observed = get_observed(data)
@@ -359,7 +382,7 @@ class CMSHistFunc(Model, Function):
             }
             for i, p in enumerate(obj.getVerticalMorphs())
         ]
-        return cls(
+        out = cls(
             x=recursor(obj.getXVar()),
             verticalParams=[m["param"] for m in morphs],
             verticalMorphsLo=jnp.array([m["lo"] for m in morphs]),
@@ -368,6 +391,16 @@ class CMSHistFunc(Model, Function):
             bberrors=_fasthisto2array(obj.errors()),
             nominal=_fasthisto2array(obj.getShape(0, 0, 0, 0)),
         )
+        if len(out.bberrors) != len(out.nominal):
+            # assume nominal has correct number of bins always
+            out.bberrors = out.bberrors[: len(out.nominal)]
+        assert len(out.verticalMorphsHi) == 0 or out.verticalMorphsHi.shape[1] == len(
+            out.nominal
+        )
+        assert len(out.verticalMorphsLo) == 0 or out.verticalMorphsLo.shape[1] == len(
+            out.nominal
+        )
+        return out
 
     @property
     def parameters(self):
@@ -383,7 +416,7 @@ class CMSHistFunc(Model, Function):
             if self.verticalType == 0:
                 # QuadLinear
                 vshift = _asym_interpolation(
-                    vertp(param),
+                    vertp(param)[:, None],
                     self.verticalMorphsHi - self.nominal,
                     self.verticalMorphsLo - self.nominal,
                 )

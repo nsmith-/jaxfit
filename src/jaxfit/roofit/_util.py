@@ -28,6 +28,8 @@ class ParameterPack:
             return lambda param: jnp.array([])
         if not all(isinstance(p, (float, str)) for p in params):
             raise RuntimeError
+        if not all(p.startswith("RooRealVar:") for p in params if isinstance(p, str)):
+            raise RuntimeError
         ref = id(params)
         self._calls[ref] = params
         self._all |= {p for p in params if not isinstance(p, float)}
@@ -55,6 +57,14 @@ class ParameterPack:
     def ravel(self, params: Dict[str, float]):
         self.finalize()
         return jnp.array([params[p] for p in self._flat])
+
+    def unravel(self, params: Array):
+        self.finalize()
+        return dict(zip(self._flat, params))
+
+    def index(self, param: str):
+        self.finalize()
+        return self._flat.index(param)
 
 
 class DataSlice:
@@ -99,13 +109,19 @@ class DataPack(DataSlice):
         callable will return a single row vector
         """
         unpack = self._auxdata.arrayof(obs)
-        return lambda data: unpack(data[("aux",)])
+        return lambda data: unpack(data[("_aux_",)])
 
-    def ravel(self, data: Dict):
-        aux = self._auxdata.ravel(
-            {obs: val for obs, val in data.items() if isinstance(obs, str)}
-        )
-        # TODO check binnning? What is the type of `array`? RooRealData?
-        out = {path: array for path, array in data.items() if isinstance(path, tuple)}
-        out.update({("aux",): aux})
+    def ravel(
+        self, data: Dict[Tuple[str], Array], auxdata: Dict[str, float]
+    ) -> Dict[Tuple[str], Array]:
+        out = {("_aux_",): self._auxdata.ravel(auxdata)}
+        # TODO check binnning? how to check that self._slices[path] matches
+        # the observables in data? if binned, then actually we just want _weight_
+        for k, v in self._slices.items():
+            if isinstance(v, list):
+                raise NotImplementedError("unbinned data")
+            else:
+                # truncate data to the necessary number of bins
+                # TODO is this just combine weirdness or what?
+                out[k] = data[k][: len(v) - 1]
         return out
