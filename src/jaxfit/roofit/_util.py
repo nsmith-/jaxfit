@@ -21,17 +21,22 @@ class ParameterPack:
         self._calls = {}
         self._finalized = False
 
-    def arrayof(self, params: List[Union[float, str]]):
+    def arrayof(self, params: List[Union[float, str]], scalar=False):
         if self._finalized:
             raise RuntimeError("you missed the bus")
         if not len(params):
             return lambda param: jnp.array([])
+        if scalar and len(params) > 1:
+            raise ValueError("Can only be scalar if one parameter is fetched")
+        if all(isinstance(p, float) for p in params):
+            consts = params[0] if scalar else jnp.array(params)
+            return lambda param: consts
         if not all(isinstance(p, (float, str)) for p in params):
             raise RuntimeError
         if not all(p.startswith("RooRealVar:") for p in params if isinstance(p, str)):
             raise RuntimeError
-        ref = id(params)
-        self._calls[ref] = params
+        ref = params[0] if scalar else tuple(params)
+        self._calls[ref] = scalar
         self._all |= {p for p in params if not isinstance(p, float)}
         return partial(self._get, ref)
 
@@ -41,18 +46,33 @@ class ParameterPack:
         self._finalized = True
         # TODO: use self._calls to make a smart choice here?
         self._flat = sorted(self._all)
-        for ref in self._calls:
-            old = self._calls[ref]
-            idx = jnp.array(
-                [-1 if isinstance(p, float) else self._flat.index(p) for p in old]
-            )
-            consts = jnp.array([p if isinstance(p, float) else 0.0 for p in old])
-            self._calls[ref] = (idx, consts)
+        ncontiguous = 0
+        for ref, scalar in self._calls.items():
+            if scalar:
+                self._calls[ref] = self._flat.index(ref)
+                continue
+            take = jnp.array([self._flat.index(p) for p in ref if isinstance(p, str)])
+            if jnp.all(jnp.diff(take) == 1):
+                ncontiguous += 1
+            if len(take) == len(ref):
+                self._calls[ref] = (take,)
+                continue
+            put = jnp.array([i for i, p in enumerate(ref) if isinstance(p, str)])
+            consts = jnp.array([p if isinstance(p, float) else 0.0 for p in ref])
+            self._calls[ref] = (take, put, consts)
+        print(f"Contiguous takes: {ncontiguous} of {len(self._calls)}")
 
     def _get(self, ref, param):
         self.finalize()
-        idx, consts = self._calls[ref]
-        return jnp.where(idx >= 0, param[idx], consts)
+        op = self._calls[ref]
+        if isinstance(op, int):
+            return param[op]
+        elif len(op) == 1:
+            (take,) = op
+            return param[take]
+        else:
+            take, put, consts = op
+            return consts.at[put].set(param[take])
 
     def ravel(self, params: Dict[str, float]):
         self.finalize()

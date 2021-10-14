@@ -69,6 +69,17 @@ class RooCategory(Model):
         )
 
 
+def _factorize_prod(fcn):
+    if isinstance(fcn, list):
+        for p in fcn:
+            yield from _factorize_prod(p)
+    elif isinstance(fcn, RooProduct):
+        for p in fcn.components:
+            yield from _factorize_prod(p)
+    else:
+        yield fcn
+
+
 @RooWorkspace.register
 @dataclass
 class RooProduct(Model, Function):
@@ -83,10 +94,26 @@ class RooProduct(Model, Function):
         return reduce(set.union, (x.parameters for x in self.components), set())
 
     def value(self, parameters):
-        # if all(isinstance(c, RooRealVar) for c in self.components):
-        #   TODO: vectorize
-        vals = [c.value(parameters) for c in self.components]
-        return lambda param: reduce(operator.mul, (v(param) for v in vals), 1.0)
+        factors = sorted(_factorize_prod(self), key=lambda p: p.name)
+        canVectorize = [isinstance(p, RooRealVar) for p in factors]
+        if any(canVectorize):
+            vparam = parameters.arrayof(
+                [
+                    p.val if p.const else p.name
+                    for p, v in zip(factors, canVectorize)
+                    if ~v
+                ]
+            )
+            addParam = [p.value(parameters) for p, v in zip(factors, canVectorize) if v]
+            if len(addParam):
+                return lambda param: reduce(
+                    jnp.multiply, (v(param) for v in addParam), jnp.prod(vparam(param))
+                )
+            else:
+                return lambda param: jnp.prod(vparam(param))
+
+        addParam = [p.value(parameters) for p in factors]
+        return lambda param: reduce(operator.mul, (v(param) for v in addParam), 1.0)
 
 
 @RooWorkspace.register
@@ -116,6 +143,14 @@ class RooRealSumPdf(Model, Distribution):
         return fpars | cpars
 
     def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+        if (
+            len(self.coefficients) == 1
+            and self.coefficients[0].const
+            and self.coefficients[0].val == 1.0
+        ):
+            # combine adds this extra layer for some reason
+            return self.functions[0].log_prob(observables, parameters)
+
         funcs = [f.log_prob(observables, parameters) for f in self.functions]
         coefs = [c.value(parameters) for c in self.coefficients]
 
@@ -275,7 +310,7 @@ class RooRealVar(Model, Parameter):
         if self.const:
             return lambda param: self.val
 
-        return parameters.arrayof([self.name])
+        return parameters.arrayof([self.name], scalar=True)
 
 
 @RooWorkspace.register

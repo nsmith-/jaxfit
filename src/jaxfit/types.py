@@ -1,4 +1,4 @@
-from typing import Callable, Dict, Protocol, Set, Tuple, Union, runtime_checkable
+from typing import Callable, Dict, Set, Tuple, Union
 
 import jaxlib.xla_extension
 from jax.interpreters.partial_eval import DynamicJaxprTracer
@@ -36,8 +36,10 @@ SolverFunction = Callable[
 ]
 
 
-@runtime_checkable
-class Distribution(Protocol):
+# TODO: abc
+
+
+class Distribution:
     @property
     def parameters(self) -> Set[str]:
         raise NotImplementedError
@@ -60,8 +62,7 @@ class Distribution(Protocol):
     # TODO: def sample(self, rng, observables, parameters, asimov=False)
 
 
-@runtime_checkable
-class Function(Protocol):
+class Function:
     def parameters(self) -> Set[str]:
         raise NotImplementedError
 
@@ -69,8 +70,7 @@ class Function(Protocol):
         raise NotImplementedError
 
 
-@runtime_checkable
-class Parameter(Protocol):
+class Parameter:
     @property
     def name(self):
         raise NotImplementedError

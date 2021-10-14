@@ -1,8 +1,35 @@
 import gzip
 import json
-from typing import Any, Type
+from functools import partial
+from typing import Any, Dict, List, Type
 
 from jaxfit.roofit.model import Model
+
+
+def _getref(seen: Dict[str, Any], obj: Any) -> str:
+    """
+    Get a guaranteed unique name to reference this object by
+    """
+    name = obj.Class().GetName() + ":" + obj.GetName()
+    # JSONPointer escape
+    name = name.replace("~", "~0").replace("/", "~1")
+    if name in seen:
+        cand = seen[name]
+        if cand is obj:
+            return name
+        elif isinstance(cand, list):
+            if obj is cand[0]:
+                return name
+            for i, o in enumerate(cand[1:]):
+                if o is obj:
+                    return f"{name};{i+1}"
+            cand.append(obj)
+            return f"{name};{len(cand)}"
+        else:
+            seen[name] = [cand]
+            return name
+    seen[name] = obj
+    return name
 
 
 class RooWorkspace:
@@ -13,11 +40,8 @@ class RooWorkspace:
         cls.models[model.__name__] = model
         return model
 
-    def __init__(self, models=None, roots=None):
-        self._inputobj = {}
-        self._out = {} if models is None else models
-        self._roots = [] if roots is None else roots
-        self._unknown_classes = set()
+    def __init__(self, roots: Dict[str, Model] = None):
+        self._roots = {} if roots is None else roots
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -28,35 +52,16 @@ class RooWorkspace:
         self.__dict__.update(state)
 
     def __getitem__(self, key):
-        return self._out[key]
+        return self._roots[key]
 
-    def getref(self, obj: Any) -> str:
-        """
-        Get a guaranteed unique name to reference this object by
-        """
-        name = obj.Class().GetName() + ":" + obj.GetName()
-        # JSONPointer escape
-        name = name.replace("~", "~0").replace("/", "~1")
-        if name in self._inputobj:
-            cand = self._inputobj[name]
-            if cand is obj:
-                return name
-            elif isinstance(cand, list):
-                if obj is cand[0]:
-                    return name
-                for i, o in enumerate(cand[1:]):
-                    if o is obj:
-                        return f"{name};{i+1}"
-                cand.append(obj)
-                return f"{name};{len(cand)}"
-            else:
-                self._inputobj[name] = [cand]
-                return name
-        self._inputobj[name] = obj
-        return name
-
-    def readobj(self, obj: Any):
-        self._roots.append(self._readobj(obj))
+    @classmethod
+    def from_root(cls, items: List[Any]):
+        """Import several items from a common ROOT RooWorkspace object"""
+        roots, inputs, known = {}, {}, {}
+        for item in items:
+            model = cls._readobj(inputs, known, item)
+            roots[model.name] = model
+        return cls(roots=roots)
 
     @classmethod
     def from_file(cls, fname: str):
@@ -68,11 +73,12 @@ class RooWorkspace:
                 data = json.load(fin)
 
         roots = data.pop("_roots")
-        out = {}
+        allobj = {}
 
         def deref(name):
+            name = name[1:]  # strip leading slash
             try:
-                return out[name]
+                return allobj[name]
             except KeyError:
                 pass
             clsname = name.split(":")[0]
@@ -83,37 +89,49 @@ class RooWorkspace:
 
             model = objclass.from_dict(data.pop(name), deref)
             model.name = name
-            out[name] = model
+            allobj[name] = model
             return model
 
-        for name in roots:
-            deref(name)
-        return cls(models=out, roots=[out[name] for name in roots])
+        out = {}
+        for item in roots:
+            obj = deref(item["$ref"])
+            out[obj.name] = obj
+        return cls(roots=out)
 
     def to_file(self, fname: str):
-        data = {name: model.to_dict() for name, model in self._out.items()}
-        data["_roots"] = [r.name for r in self._roots]
+        out = {}
+
+        def ref(obj):
+            if obj.name not in out:
+                out[obj.name] = obj.to_dict(ref)
+            return f"/{obj.name}"
+
+        out["_roots"] = [{"$ref": ref(obj)} for obj in self._roots.values()]
         if fname.endswith(".gz"):
             with gzip.open(fname, "wt") as fout:
-                json.dump(data, fout)
+                json.dump(out, fout)
         else:
             with open(fname, "w") as fout:
-                json.dump(data, fout)
+                json.dump(out, fout)
 
-    def _readobj(self, obj: Any) -> Model:
-        name = self.getref(obj)
+    @classmethod
+    def _readobj(
+        cls, inputs: Dict[str, Any], known: Dict[str, Model], obj: Any
+    ) -> Model:
+        name = _getref(inputs, obj)
         try:
-            return self._out[name]
+            return known[name]
         except KeyError:
             pass
         objclass = obj.Class().GetName()
-
         try:
-            model = self.models[objclass].readobj(obj, self._readobj)
+            modelclass = cls.models[objclass]
         except KeyError:
-            self._unknown_classes.add(objclass)
-            model = self.models["_Unknown"].readobj(obj, self._readobj)
+            cls._unknown_classes.add(objclass)
+            modelclass = cls.models["_Unknown"]
 
+        recursor = partial(cls._readobj, inputs, known)
+        model = modelclass.readobj(obj, recursor)
         model.name = name
-        self._out[name] = model
+        known[name] = model
         return model

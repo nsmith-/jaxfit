@@ -1,12 +1,12 @@
 """Custom RooFit objects found in CMS combine
 """
-import operator
 from dataclasses import dataclass
 from functools import reduce
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import jax.numpy as jnp
 import jax.scipy.stats as stats
+import numpy as np
 
 from jaxfit.roofit._util import DataPack, DataSlice, ParameterPack
 from jaxfit.roofit.common import (
@@ -16,7 +16,6 @@ from jaxfit.roofit.common import (
     RooPoisson,
     RooProdPdf,
     RooProduct,
-    RooRealVar,
 )
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
@@ -33,17 +32,6 @@ def _factorize_prodpdf(pdf):
             yield from _factorize_prodpdf(p)
     else:
         yield pdf
-
-
-def _factorize_prod(fcn):
-    if isinstance(fcn, list):
-        for p in fcn:
-            yield from _factorize_prod(p)
-    elif isinstance(fcn, RooProduct):
-        for p in fcn.components:
-            yield from _factorize_prod(p)
-    else:
-        yield fcn
 
 
 @RooWorkspace.register
@@ -133,7 +121,7 @@ class RooSimultaneousOpt(Model, Distribution):
             )
             pois_prob = stats.poisson.logpmf(poisx(data), mu=poism(param))
             return (
-                sum(generic[cat](data, param) for cat in self.pdfs)
+                reduce(jnp.add, (generic[cat](data, param) for cat in self.pdfs))
                 + jnp.sum(gaus_prob)
                 + jnp.sum(pois_prob)
             )
@@ -141,22 +129,24 @@ class RooSimultaneousOpt(Model, Distribution):
         return logp
 
 
-def _asym_interpolation(θ, δp, δm):
+_asym_poly = jnp.array([3.0, -10.0, 15.0, 0.0]) / 8.0
+
+
+def _asym_interpolation(x, dx_sum, dx_diff):
     """A function that is C^2 continuous in theta
 
-    delta_p, delta_m should both be signed quantities
+    dx_sum is the sum of positive and negative relative shifts,
+    dx_diff is the difference
     """
-    morph = jnp.where(
-        θ > 1,
-        δp * θ,
-        jnp.where(
-            θ < -1,
-            δm * θ,
-            0.5
-            * (
-                (δp + δm) * θ + (δp - δm) * (3 * θ ** 6 - 10 * θ ** 4 + 15 * θ ** 2) / 8
-            ),
-        ),
+    ax = abs(x)
+    morph = 0.5 * (
+        dx_sum * x
+        + dx_diff
+        * jnp.where(
+            ax > 1.0,
+            ax,
+            jnp.polyval(_asym_poly, x * x),
+        )
     )
     return morph
 
@@ -170,11 +160,18 @@ class ProcessNormalization(Model, Function):
     asymParams: List[Model]
     asymLogKappaLo: Array  # 1d
     asymLogKappaHi: Array  # 1d
-    additional: List[Model]
+    additional: Optional[Model]
 
     @classmethod
     def readobj(cls, obj, recursor):
         asympar = [[-lo, hi] for lo, hi in obj.getAsymLogKappa()]
+        addpar = [recursor(p) for p in obj.getAdditionalModifiers()]
+        if len(addpar) > 1:
+            addpar = RooProduct(components=addpar)
+        elif len(addpar) == 0:
+            addpar = None
+        else:
+            addpar = addpar[0]
         return cls(
             nominal=obj.getNominalValue(),
             symParams=[recursor(p) for p in obj.getSymErrorParameters()],
@@ -182,42 +179,37 @@ class ProcessNormalization(Model, Function):
             asymParams=[recursor(p) for p in obj.getAsymErrorParameters()],
             asymLogKappaLo=jnp.array([p[0] for p in asympar]),
             asymLogKappaHi=jnp.array([p[1] for p in asympar]),
-            additional=[recursor(p) for p in obj.getAdditionalModifiers()],
+            additional=addpar,
         )
 
     @property
     def parameters(self):
         return reduce(
             set.union,
-            (p.parameters for p in self.symParams + self.asymParams + self.additional),
-            set(),
+            (p.parameters for p in self.symParams + self.asymParams),
+            self.additional.parameters if self.additional else set(),
         )
 
     def value(self, parameters: ParameterPack):
         symTheta = parameters.arrayof([p.name for p in self.symParams])
         asymTheta = parameters.arrayof([p.name for p in self.asymParams])
-        addParam = list(_factorize_prod(self.additional))
-        canVectorizeAddParam = all(isinstance(p, RooRealVar) for p in addParam)
-        if canVectorizeAddParam:
-            addParam = parameters.arrayof(
-                [p.val if p.const else p.name for p in addParam]
-            )
+        asymSum = self.asymLogKappaHi + self.asymLogKappaLo
+        asymDiff = self.asymLogKappaHi - self.asymLogKappaLo
+        if self.additional:
+            addParam = self.additional.value(parameters)
         else:
-            addParam = [p.value(parameters) for p in addParam]
+            addParam = None
 
         def val(param):
             symShift = jnp.sum(self.symLogKappa * symTheta(param), axis=-1)
             asymShift = jnp.sum(
-                _asym_interpolation(
-                    asymTheta(param), self.asymLogKappaHi, self.asymLogKappaLo
-                ),
+                _asym_interpolation(asymTheta(param), asymSum, asymDiff),
                 axis=-1,
             )
-            if canVectorizeAddParam:
-                addFactor = jnp.prod(addParam(param))
-            else:
-                addFactor = reduce(operator.mul, (p(param) for p in addParam), 1.0)
-            return self.nominal * jnp.exp(symShift + asymShift) * addFactor
+            out = self.nominal * jnp.exp(symShift + asymShift)
+            if addParam is not None:
+                out = out * addParam(param)
+            return out
 
         return val
 
@@ -289,11 +281,11 @@ class CMSHistErrorPropagator(Model, Distribution):
             bbpars=bbpars,
             bbscale=bbscale,
         )
+        if any(x.name == "RooRealVar:ZERO" for x in out.coefficients):
+            # we should just trim the process from this model
+            raise NotImplementedError("model where one coefficient is fixed to zero")
         assert all(isinstance(x, CMSHistFunc) for x in out.functions)
-        assert all(
-            isinstance(x, ProcessNormalization) or x.name == "RooRealVar:ZERO"
-            for x in out.coefficients
-        )
+        assert all(isinstance(x, ProcessNormalization) for x in out.coefficients)
         return out
 
     @property
@@ -317,10 +309,61 @@ class CMSHistErrorPropagator(Model, Distribution):
         return fpars | cpars | bpars
 
     def log_prob(self, observables: DataSlice, parameters: ParameterPack):
-        chvals = [
-            (f.value(parameters), c.value(parameters))
-            for f, c in zip(self.functions, self.coefficients)
+        procvals = [f.value(parameters) for f in self.functions]
+
+        # procnorms = [c.value(parameters) for c in self.coefficients]
+        # vectorize the process normalizations
+        procnorm_nominal = jnp.array([c.nominal for c in self.coefficients])
+        procnorm_symParams = sorted(
+            reduce(
+                set.union,
+                (set(p.name for p in c.symParams) for c in self.coefficients),
+                set(),
+            )
+        )
+        procnorm_symLogKappa = np.zeros(
+            shape=(len(self.coefficients), len(procnorm_symParams))
+        )
+        for i, c in enumerate(self.coefficients):
+            for p, val in zip(c.symParams, c.symLogKappa):
+                try:
+                    pos = procnorm_symParams.index(p.name)
+                    procnorm_symLogKappa[i, pos] = val
+                except ValueError:
+                    pass
+        procnorm_symLogKappa = jnp.array(procnorm_symLogKappa)
+        procnorm_symParams = parameters.arrayof(procnorm_symParams)
+
+        procnorm_asymParams = sorted(
+            reduce(
+                set.union,
+                (set(p.name for p in c.asymParams) for c in self.coefficients),
+                set(),
+            )
+        )
+        procnorm_asymLogKappaSum = np.zeros(
+            shape=(len(self.coefficients), len(procnorm_asymParams))
+        )
+        procnorm_asymLogKappaDiff = np.zeros(
+            shape=(len(self.coefficients), len(procnorm_asymParams))
+        )
+        for i, c in enumerate(self.coefficients):
+            for p, lo, hi in zip(c.asymParams, c.asymLogKappaLo, c.asymLogKappaHi):
+                try:
+                    pos = procnorm_asymParams.index(p.name)
+                    procnorm_asymLogKappaSum[i, pos] = hi + lo
+                    procnorm_asymLogKappaDiff[i, pos] = hi - lo
+                except ValueError:
+                    pass
+        procnorm_asymLogKappaSum = jnp.array(procnorm_asymLogKappaSum)
+        procnorm_asymLogKappaDiff = jnp.array(procnorm_asymLogKappaDiff)
+        procnorm_asymParams = parameters.arrayof(procnorm_asymParams)
+
+        procnorm_additional = [
+            c.additional.value(parameters) if c.additional else None
+            for c in self.coefficients
         ]
+
         bb_errors = jnp.array([f.bberrors for f in self.functions]).T
         bblite_errors = jnp.sqrt(jnp.sum(bb_errors ** 2, axis=1))
         bbparams = parameters.arrayof(
@@ -335,26 +378,32 @@ class CMSHistErrorPropagator(Model, Distribution):
 
         def logp(data, param):
             observed = get_observed(data)
-            expected_perchannel = jnp.array([f(param) * c(param) for f, c in chvals]).T
+            symShift = jnp.sum(procnorm_symLogKappa * procnorm_symParams(param), axis=1)
+            asymShift = jnp.sum(
+                _asym_interpolation(
+                    procnorm_asymParams(param),
+                    procnorm_asymLogKappaSum,
+                    procnorm_asymLogKappaDiff,
+                ),
+                axis=1,
+            )
+            addParam = jnp.array([p(param) if p else 1.0 for p in procnorm_additional])
+            norm = procnorm_nominal * jnp.exp(symShift + asymShift) * addParam
+            # norm = jnp.array([c(param) for c in procnorms])
+            process_expected = norm * jnp.array([f(param) for f in procvals]).T
             # here we can do analytic Balow-Beeston in principle
             bb = bbparams(param).reshape(self.bbscale.shape)
-            expected_perchannel = expected_perchannel + jnp.where(
+            process_expected = process_expected + jnp.where(
                 self.bbscale > 0.0,
-                (bb * self.bbscale - 1) * expected_perchannel,
+                (bb * self.bbscale - 1) * process_expected,
                 jnp.where(
                     self.bbscale == 0.0,
                     bb_errors * bb,
                     jnp.where(self.bbscale == -1.0, bblite_errors[:, None] * bb, 0.0),
                 ),
             )
-            expected = jnp.sum(expected_perchannel, axis=1)
+            expected = jnp.sum(process_expected, axis=1)
             return jnp.sum(stats.poisson.logpmf(observed, expected))
-            # Multinomial distribution term
-            # dterm = special.gammaln(observed_total + 1) + jnp.sum(
-            #     special.xlogy(observed_diff, expected_diff)
-            #     - special.gammaln(observed_diff + 1),
-            #     axis=-1,
-            # )
 
         return logp
 
@@ -411,25 +460,30 @@ class CMSHistFunc(Model, Function):
             return lambda param: self.nominal
 
         vertp = parameters.arrayof([p.name for p in self.verticalParams])
+        if self.verticalType == 0:
+            asymSum = self.verticalMorphsHi + self.verticalMorphsLo - 2 * self.nominal
+            asymDiff = self.verticalMorphsHi - self.verticalMorphsLo
+        elif self.verticalType == 1:
+            asymSum = jnp.log(self.verticalMorphsHi / self.nominal) + jnp.log(
+                self.verticalMorphsLo / self.nominal
+            )
+            asymDiff = jnp.log(self.verticalMorphsHi / self.nominal) - jnp.log(
+                self.verticalMorphsLo / self.nominal
+            )
+        else:
+            raise NotImplementedError(f"vertical type {self.verticalType}")
 
         def val(param):
+            vshift = jnp.sum(
+                _asym_interpolation(vertp(param)[:, None], asymSum, asymDiff), axis=0
+            )
             if self.verticalType == 0:
                 # QuadLinear
-                vshift = _asym_interpolation(
-                    vertp(param)[:, None],
-                    self.verticalMorphsHi - self.nominal,
-                    self.verticalMorphsLo - self.nominal,
-                )
                 # TODO: why 3x!!
-                return self.nominal + 3 * jnp.sum(vshift, axis=0)
+                return self.nominal + 3 * vshift
             elif self.verticalType == 1:
                 # LogQuadLinear
-                vshift = _asym_interpolation(
-                    vertp,
-                    jnp.log(self.verticalMorphsHi / self.nominal),
-                    jnp.log(self.verticalMorphsLo / self.nominal),
-                )
-                return self.nominal * jnp.exp(jnp.sum(vshift, axis=0))
+                return self.nominal * jnp.exp(vshift)
 
         return val
 
