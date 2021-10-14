@@ -21,6 +21,10 @@ from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
 from jaxfit.types import Array, Distribution, Function
 
+# debug/validation flags
+VECTORIZE_CMSHistFunc = True
+VECTORIZE_ProcessNormalization = True
+
 
 def _fasthisto2array(h):
     return jnp.array([h[i] for i in range(h.size())])
@@ -109,11 +113,13 @@ class RooSimultaneousOpt(Model, Distribution):
                         raise RuntimeError("did we over-factorize?")
                     generic[cat] = pdf.log_prob(observables.slice(cat), parameters)
 
-        gausx = observables.arrayof([p for p in gaus_constr])
-        gausm = parameters.arrayof([p for p, _ in gaus_constr.values()])
-        gauss = parameters.arrayof([p for _, p in gaus_constr.values()])
-        poisx = observables.arrayof([p for p in pois_constr])
-        poism = parameters.arrayof(list(pois_constr.values()))
+        gaus_constr = sorted((x, mu, sigma) for x, (mu, sigma) in gaus_constr)
+        gausx = observables.arrayof([p for p, _, _ in gaus_constr])
+        gausm = parameters.arrayof([p for _, p, _ in gaus_constr])
+        gauss = parameters.arrayof([p for _, _, p in gaus_constr])
+        pois_constr = sorted((x, mu) for x, mu in pois_constr)
+        poisx = observables.arrayof([p for p, _ in pois_constr])
+        poism = parameters.arrayof([p for _, p in pois_constr])
 
         def logp(data, param):
             gaus_prob = stats.norm.logpdf(
@@ -189,6 +195,67 @@ class ProcessNormalization(Model, Function):
             (p.parameters for p in self.symParams + self.asymParams),
             self.additional.parameters if self.additional else set(),
         )
+
+    @classmethod
+    def vectorize(cls, items: List["ProcessNormalization"], parameters: ParameterPack):
+        nominal = jnp.array([c.nominal for c in items])
+        symParams = sorted(
+            reduce(
+                set.union,
+                (set(p.name for p in c.symParams) for c in items),
+                set(),
+            )
+        )
+        symLogKappa = np.zeros(shape=(len(items), len(symParams)))
+        for i, c in enumerate(items):
+            for p, val in zip(c.symParams, c.symLogKappa):
+                try:
+                    pos = symParams.index(p.name)
+                except ValueError:
+                    continue
+                symLogKappa[i, pos] = val
+        symLogKappa = jnp.array(symLogKappa)
+        symParams = parameters.arrayof(symParams)
+
+        asymParams = sorted(
+            reduce(
+                set.union,
+                (set(p.name for p in c.asymParams) for c in items),
+                set(),
+            )
+        )
+        asymLogKappaSum = np.zeros(shape=(len(items), len(asymParams)))
+        asymLogKappaDiff = np.zeros(shape=(len(items), len(asymParams)))
+        for i, c in enumerate(items):
+            for p, lo, hi in zip(c.asymParams, c.asymLogKappaLo, c.asymLogKappaHi):
+                try:
+                    pos = asymParams.index(p.name)
+                except ValueError:
+                    continue
+                asymLogKappaSum[i, pos] = hi + lo
+                asymLogKappaDiff[i, pos] = hi - lo
+        asymLogKappaSum = jnp.array(asymLogKappaSum)
+        asymLogKappaDiff = jnp.array(asymLogKappaDiff)
+        asymParams = parameters.arrayof(asymParams)
+
+        additional = [
+            c.additional.value(parameters) if c.additional else None for c in items
+        ]
+
+        def val(param):
+            symShift = jnp.sum(symLogKappa * symParams(param), axis=1)
+            asymShift = jnp.sum(
+                _asym_interpolation(
+                    asymParams(param),
+                    asymLogKappaSum,
+                    asymLogKappaDiff,
+                ),
+                axis=1,
+            )
+            addParam = jnp.array([p(param) if p else 1.0 for p in additional])
+            return nominal * jnp.exp(symShift + asymShift) * addParam
+
+        return val
 
     def value(self, parameters: ParameterPack):
         symTheta = parameters.arrayof([p.name for p in self.symParams])
@@ -309,60 +376,14 @@ class CMSHistErrorPropagator(Model, Distribution):
         return fpars | cpars | bpars
 
     def log_prob(self, observables: DataSlice, parameters: ParameterPack):
-        procvals = [f.value(parameters) for f in self.functions]
-
-        # procnorms = [c.value(parameters) for c in self.coefficients]
-        # vectorize the process normalizations
-        procnorm_nominal = jnp.array([c.nominal for c in self.coefficients])
-        procnorm_symParams = sorted(
-            reduce(
-                set.union,
-                (set(p.name for p in c.symParams) for c in self.coefficients),
-                set(),
-            )
-        )
-        procnorm_symLogKappa = np.zeros(
-            shape=(len(self.coefficients), len(procnorm_symParams))
-        )
-        for i, c in enumerate(self.coefficients):
-            for p, val in zip(c.symParams, c.symLogKappa):
-                try:
-                    pos = procnorm_symParams.index(p.name)
-                    procnorm_symLogKappa[i, pos] = val
-                except ValueError:
-                    pass
-        procnorm_symLogKappa = jnp.array(procnorm_symLogKappa)
-        procnorm_symParams = parameters.arrayof(procnorm_symParams)
-
-        procnorm_asymParams = sorted(
-            reduce(
-                set.union,
-                (set(p.name for p in c.asymParams) for c in self.coefficients),
-                set(),
-            )
-        )
-        procnorm_asymLogKappaSum = np.zeros(
-            shape=(len(self.coefficients), len(procnorm_asymParams))
-        )
-        procnorm_asymLogKappaDiff = np.zeros(
-            shape=(len(self.coefficients), len(procnorm_asymParams))
-        )
-        for i, c in enumerate(self.coefficients):
-            for p, lo, hi in zip(c.asymParams, c.asymLogKappaLo, c.asymLogKappaHi):
-                try:
-                    pos = procnorm_asymParams.index(p.name)
-                    procnorm_asymLogKappaSum[i, pos] = hi + lo
-                    procnorm_asymLogKappaDiff[i, pos] = hi - lo
-                except ValueError:
-                    pass
-        procnorm_asymLogKappaSum = jnp.array(procnorm_asymLogKappaSum)
-        procnorm_asymLogKappaDiff = jnp.array(procnorm_asymLogKappaDiff)
-        procnorm_asymParams = parameters.arrayof(procnorm_asymParams)
-
-        procnorm_additional = [
-            c.additional.value(parameters) if c.additional else None
-            for c in self.coefficients
-        ]
+        if VECTORIZE_CMSHistFunc:
+            procvals = CMSHistFunc.vectorize(self.functions, parameters)
+        else:
+            procvals = [f.value(parameters) for f in self.functions]
+        if VECTORIZE_ProcessNormalization:
+            procnorms = ProcessNormalization.vectorize(self.coefficients, parameters)
+        else:
+            procnorms = [c.value(parameters) for c in self.coefficients]
 
         bb_errors = jnp.array([f.bberrors for f in self.functions]).T
         bblite_errors = jnp.sqrt(jnp.sum(bb_errors ** 2, axis=1))
@@ -378,19 +399,14 @@ class CMSHistErrorPropagator(Model, Distribution):
 
         def logp(data, param):
             observed = get_observed(data)
-            symShift = jnp.sum(procnorm_symLogKappa * procnorm_symParams(param), axis=1)
-            asymShift = jnp.sum(
-                _asym_interpolation(
-                    procnorm_asymParams(param),
-                    procnorm_asymLogKappaSum,
-                    procnorm_asymLogKappaDiff,
-                ),
-                axis=1,
-            )
-            addParam = jnp.array([p(param) if p else 1.0 for p in procnorm_additional])
-            norm = procnorm_nominal * jnp.exp(symShift + asymShift) * addParam
-            # norm = jnp.array([c(param) for c in procnorms])
-            process_expected = norm * jnp.array([f(param) for f in procvals]).T
+            if VECTORIZE_ProcessNormalization:
+                norm = procnorms(param)
+            else:
+                norm = jnp.array([c(param) for c in procnorms])
+            if VECTORIZE_CMSHistFunc:
+                process_expected = norm * procvals(param).T
+            else:
+                process_expected = norm * jnp.array([f(param) for f in procvals]).T
             # here we can do analytic Balow-Beeston in principle
             bb = bbparams(param).reshape(self.bbscale.shape)
             process_expected = process_expected + jnp.where(
@@ -454,6 +470,55 @@ class CMSHistFunc(Model, Function):
     @property
     def parameters(self):
         return reduce(set.union, (p.parameters for p in self.verticalParams), set())
+
+    @classmethod
+    def vectorize(cls, items: List["CMSHistFunc"], parameters: ParameterPack):
+        nominal = jnp.array([c.nominal for c in items])
+        nbins = nominal.shape[-1]
+        verticalType = jnp.array([c.verticalType for c in items])
+        verticalParams = sorted(
+            reduce(
+                set.union,
+                (set(p.name for p in c.verticalParams) for c in items),
+                set(),
+            )
+        )
+        posmap = {n: i for i, n in enumerate(verticalParams)}
+        asymSum = np.zeros(shape=(len(items), len(verticalParams), nbins))
+        asymDiff = np.zeros(shape=(len(items), len(verticalParams), nbins))
+        for i, c in enumerate(items):
+            nom = c.nominal
+            for p, lo, hi in zip(
+                c.verticalParams, c.verticalMorphsLo, c.verticalMorphsHi
+            ):
+                try:
+                    pos = posmap[p.name]
+                except KeyError:
+                    continue
+                if c.verticalType == 0:
+                    asymSum[i, pos, :] = hi + lo - 2 * nom
+                    asymDiff[i, pos, :] = hi - lo
+                else:
+                    asymSum[i, pos, :] = np.log(hi / nom)
+                    asymDiff[i, pos, :] = np.log(lo / nom)
+        asymSum = jnp.array(asymSum)
+        asymDiff = jnp.array(asymDiff)
+        verticalParams = parameters.arrayof(verticalParams)
+
+        def val(param):
+            vshift = jnp.sum(
+                _asym_interpolation(
+                    verticalParams(param)[None, :, None], asymSum, asymDiff
+                ),
+                axis=1,
+            )
+            return jnp.where(
+                (verticalType == 0)[:, None],
+                nominal + 3 * vshift,
+                nominal * jnp.exp(vshift),
+            )
+
+        return val
 
     def value(self, parameters: ParameterPack):
         if not len(self.verticalParams):

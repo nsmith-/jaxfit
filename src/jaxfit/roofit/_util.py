@@ -1,7 +1,9 @@
+from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Tuple, Union
 
 import jax.numpy as jnp
+import numpy as np
 
 from jaxfit.types import Array
 
@@ -13,6 +15,38 @@ def _importROOT():
         raise RuntimeError("This code path requires ROOT to be available")
     # TODO: check v6.22 at least
     return ROOT
+
+
+def _parameter_sorter(allvars, calls):
+    """greedy traveling salesman-ish"""
+    presort = {n: i for i, n in enumerate(allvars)}
+    adjacency = np.zeros(shape=(len(presort), len(presort)))
+    for ref, count in calls.items():
+        if isinstance(ref, str):
+            continue
+        pars = [p for p in ref if isinstance(p, str)]
+        for i, j in zip(pars[:-1], pars[1:]):
+            adjacency[presort[i], presort[j]] += count
+    flat = []
+    unvisited = set(range(len(presort)))
+    while unvisited:
+        i = min(unvisited)
+        unvisited.remove(i)
+        p = allvars[i]
+        flat.append(p)
+        while i >= 0:
+            for inext in np.argsort(adjacency[i])[::-1]:
+                if adjacency[i, inext] > 0 and inext in unvisited:
+                    p = allvars[inext]
+                    flat.append(p)
+                    unvisited.remove(inext)
+                    i = inext
+                elif adjacency[i, inext] > 0:
+                    continue
+                else:
+                    i = -1
+                break
+    return flat
 
 
 class ParameterPack:
@@ -36,31 +70,44 @@ class ParameterPack:
         if not all(p.startswith("RooRealVar:") for p in params if isinstance(p, str)):
             raise RuntimeError
         ref = params[0] if scalar else tuple(params)
-        self._calls[ref] = scalar
-        self._all |= {p for p in params if not isinstance(p, float)}
+        if ref in self._calls:
+            self._calls[ref] += 1
+        else:
+            self._calls[ref] = 1
+            self._all |= {p for p in params if not isinstance(p, float)}
         return partial(self._get, ref)
 
     def finalize(self):
         if self._finalized:
             return
         self._finalized = True
-        # TODO: use self._calls to make a smart choice here?
         self._flat = sorted(self._all)
-        ncontiguous = 0
-        for ref, scalar in self._calls.items():
-            if scalar:
+        if False:
+            # seems slower in some cases?
+            self._flat = _parameter_sorter(self._flat, self._calls)
+
+        stats = defaultdict(int)
+        for ref in self._calls:
+            if isinstance(ref, str):
                 self._calls[ref] = self._flat.index(ref)
+                stats["scalar"] += 1
                 continue
             take = jnp.array([self._flat.index(p) for p in ref if isinstance(p, str)])
             if jnp.all(jnp.diff(take) == 1):
-                ncontiguous += 1
-            if len(take) == len(ref):
+                take = slice(int(take[0]), int(take[-1]) + 1)
+                stats["contiguous take"] += 1
+            if all(isinstance(p, str) for p in ref):
                 self._calls[ref] = (take,)
+                stats["skip put"] += 1
                 continue
             put = jnp.array([i for i, p in enumerate(ref) if isinstance(p, str)])
+            if jnp.all(jnp.diff(put) == 1):
+                put = slice(int(put[0]), int(put[-1]) + 1)
+                stats["contiguous put"] += 1
             consts = jnp.array([p if isinstance(p, float) else 0.0 for p in ref])
             self._calls[ref] = (take, put, consts)
-        print(f"Contiguous takes: {ncontiguous} of {len(self._calls)}")
+            stats["full"] += 1
+        print(f"ParameterPack stats: {dict(stats)} ({len(self._calls)} calls)")
 
     def _get(self, ref, param):
         self.finalize()
