@@ -1,5 +1,5 @@
 from collections import defaultdict
-from functools import partial
+from functools import partial, reduce
 from typing import Dict, List, Tuple, Union
 
 import jax.numpy as jnp
@@ -162,7 +162,7 @@ class DataPack(DataSlice):
     def _array(self, obs: Union[List[str], Array], path: Tuple[str]):
         if path in self._slices:
             raise RuntimeError(f"Data used twice! path: {path}")
-        if path[0] == "aux":
+        if path[0] == "_aux_":
             raise RuntimeError("aux is a protected name, please change category name")
         self._slices[path] = obs
         return lambda data: data[path]
@@ -178,17 +178,40 @@ class DataPack(DataSlice):
         unpack = self._auxdata.arrayof(obs)
         return lambda data: unpack(data[("_aux_",)])
 
-    def ravel(
-        self, data: Dict[Tuple[str], Array], auxdata: Dict[str, float]
-    ) -> Dict[Tuple[str], Array]:
+    def ravel(self, data, auxdata: Dict[str, float]) -> Dict[Tuple[str], Array]:
+        # NB data is RooDataSet but circular import.. need to move some of this
         out = {("_aux_",): self._auxdata.ravel(auxdata)}
-        # TODO check binnning? how to check that self._slices[path] matches
-        # the observables in data? if binned, then actually we just want _weight_
+        categories = data.categories()
         for k, v in self._slices.items():
+            # TODO check that k matches the observables in data
+            if len(k) != len(categories):
+                raise RuntimeError("Expected data to have same categories as slice")
+            cut = reduce(
+                jnp.logical_and,
+                (
+                    data.points[col, :] == cat.labels.index(key)
+                    for (col, cat), key in zip(categories, k)
+                ),
+            )
+            catdata = data.points[:, cut]
             if isinstance(v, list):
-                raise NotImplementedError("unbinned data")
+                cols = []
+                for colname in v:
+                    for i, col in data.variables():
+                        if col.name == colname:
+                            cols.append(i)
+                if len(cols) != len(v):
+                    raise RuntimeError("missing columns")
+                out[k] = catdata[tuple(cols), :]
             else:
-                # truncate data to the necessary number of bins
-                # TODO is this just combine weirdness or what?
-                out[k] = data[k][: len(v) - 1]
+                if len(data.variables()) != 2:
+                    raise NotImplementedError("Binned data in multiple dimensions?")
+                col, var = data.variables()[0]
+                # at least for combine this ends up being bin centers
+                # and for some reason isn't truncated
+                centers = catdata[col, : len(v) - 1]
+                if not jnp.all(centers == 0.5 * (v[1:] + v[:-1])):
+                    raise RuntimeError("Data centers do not match expected binning")
+                assert data.variables()[-1][1].name == "RooRealVar:_weight_"
+                out[k] = catdata[-1, : len(v) - 1]
         return out

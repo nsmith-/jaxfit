@@ -1,18 +1,19 @@
 """Built-in RooFit objects
 """
-import itertools
-import operator
 from dataclasses import dataclass
 from functools import reduce
-from typing import Dict, Iterable, List, Tuple
+from typing import List, Tuple
 
 import jax.numpy as jnp
 import jax.scipy.stats as stats
+import numpy as np
 
 from jaxfit.roofit._util import DataSlice, ParameterPack, _importROOT
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
 from jaxfit.types import Array, Distribution, Function, Parameter
+
+BREAK_UNKNOWN = False
 
 
 @RooWorkspace.register
@@ -22,9 +23,10 @@ class _Unknown(Model):
 
     @classmethod
     def readobj(cls, obj, recursor):
-        import pdb
+        if BREAK_UNKNOWN:
+            import pdb
 
-        pdb.set_trace()
+            pdb.set_trace()
         return cls(children=[recursor(child) for child in obj.servers()])
 
 
@@ -64,9 +66,12 @@ class RooCategory(Model):
 
     @classmethod
     def readobj(cls, obj, recursor):
-        return cls(
-            labels=[label for label, idx in obj.states()],
-        )
+        items = list(tuple(s) for s in obj.states())
+        items.sort(key=lambda s: s[1])
+        labels, indices = map(list, zip(*items))
+        if not all(i == j for i, j in enumerate(indices)):
+            raise RuntimeError("Category indices have gaps")
+        return cls(labels=labels)
 
 
 def _factorize_prod(fcn):
@@ -101,10 +106,12 @@ class RooProduct(Model, Function):
                 [
                     p.val if p.const else p.name
                     for p, v in zip(factors, canVectorize)
-                    if ~v
+                    if v
                 ]
             )
-            addParam = [p.value(parameters) for p, v in zip(factors, canVectorize) if v]
+            addParam = [
+                p.value(parameters) for p, v in zip(factors, canVectorize) if not v
+            ]
             if len(addParam):
                 return lambda param: reduce(
                     jnp.multiply, (v(param) for v in addParam), jnp.prod(vparam(param))
@@ -113,7 +120,22 @@ class RooProduct(Model, Function):
                 return lambda param: jnp.prod(vparam(param))
 
         addParam = [p.value(parameters) for p in factors]
-        return lambda param: reduce(operator.mul, (v(param) for v in addParam), 1.0)
+        return lambda param: reduce(jnp.multiply, (v(param) for v in addParam))
+
+
+@RooWorkspace.register
+@dataclass
+class RooAddPdf(Model, Distribution):
+    pdfs: List[Model]
+    coefficients: List[Model]
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        out = cls(
+            pdfs=[recursor(f) for f in obj.pdfList()],
+            coefficients=[recursor(c) for c in obj.coefList()],
+        )
+        return out
 
 
 @RooWorkspace.register
@@ -218,6 +240,7 @@ class RooGaussian(Model):
         return self.mean.parameters | self.sigma.parameters
 
     def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+        raise RuntimeError("unvectorized gaussian")
         x = observables.arrayof([self.x.name])
         loc = parameters.arrayof([self.mean.name])
         scale = parameters.arrayof([self.sigma.name])
@@ -230,6 +253,18 @@ class RooGaussian(Model):
             )
 
         return logp
+
+
+@RooWorkspace.register
+@dataclass
+class RooUniform(Model):
+    x: List[Model]
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        # FIXME: in ROOT 6.24 we get proxy accessors (getProxy/numProxies)
+        x = [recursor(x) for x in obj.servers()]
+        return cls(x=x)
 
 
 @RooWorkspace.register
@@ -342,7 +377,7 @@ class RooConstVar(Model, Parameter):
 @dataclass
 class RooDataSet(Model):
     observables: List[Model]
-    points: List[Array]  # 1-d
+    points: Array  # (obs, evt)
 
     @classmethod
     def readobj(cls, obj, recursor):
@@ -351,36 +386,37 @@ class RooDataSet(Model):
         if not isinstance(data, ROOT.RooVectorDataStore):
             raise NotImplementedError("Non-memory data stores")
 
+        n = data.numEntries()
+        if n == 0:
+            raise RuntimeError("Empty dataset!")
+
         observables = [recursor(p) for p in data.row()]
-        if not observables[-1].name.endswith("_weight_"):
+        weighted = data.isWeighted()
+        if (observables[-1].name == "RooRealVar:_weight_") != weighted:
             raise RuntimeError(
-                f"Data without a weight observable? isWeighted: {data.isWeighted()}"
+                "Presence of _weight_ observable is inconsistent with isWeighted"
             )
-        if sum(isinstance(p, RooCategory) for p in observables) > 1:
-            raise NotImplementedError(
-                "Have not confirmed multi-category datasets ordering"
-            )
-        if sum(isinstance(p, RooRealVar) for p in observables) > 2:
-            raise NotImplementedError("Have not implemented multi-dimensional pdfs")
-        points = [jnp.array(list(val)) for val in data.getBatch(0, data.size())]
+        points = np.empty(shape=(len(observables), n))
+        for j in range(n):
+            for i, (obs, x) in enumerate(zip(observables, data.get(j))):
+                # NB: int to float conversion for category index
+                points[i, j] = (
+                    x.getVal() if isinstance(obs, RooRealVar) else x.getIndex()
+                )
+            if weighted:
+                points[-1, j] = data.weight()
         out = cls(
             observables=observables,
-            points=points,
+            points=jnp.array(points),
         )
         return out
 
-    def categories(self) -> Iterable[Tuple[str]]:
-        return itertools.product(
-            *(p.labels for p in self.observables if isinstance(p, RooCategory))
-        )
+    def categories(self) -> List[Tuple[int, str]]:
+        return [
+            (i, p) for i, p in enumerate(self.observables) if isinstance(p, RooCategory)
+        ]
 
-    def columns(self) -> Iterable[str]:
-        return (p.name for p in self.observables if isinstance(p, RooRealVar))
-
-    def __getitem__(self, col: str) -> Dict[Tuple[str], Array]:
-        catkeys = list(self.categories())
-        for c, v in zip(self.columns(), self.points):
-            v = v.reshape(len(catkeys), -1)
-            if c == col:
-                return {k: v[i] for i, k in enumerate(catkeys)}
-        raise KeyError(col)
+    def variables(self) -> List[Tuple[int, str]]:
+        return [
+            (i, p) for i, p in enumerate(self.observables) if isinstance(p, RooRealVar)
+        ]

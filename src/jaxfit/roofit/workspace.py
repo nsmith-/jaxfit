@@ -1,6 +1,5 @@
 import gzip
 import json
-from functools import partial
 from typing import Any, Dict, List, Type
 
 from jaxfit.roofit.model import Model
@@ -58,9 +57,31 @@ class RooWorkspace:
     def from_root(cls, items: List[Any]):
         """Import several items from a common ROOT RooWorkspace object"""
         roots, inputs, known = {}, {}, {}
+        unknown = set()
+
+        def readobj(obj: Any) -> Model:
+            name = _getref(inputs, obj)
+            try:
+                return known[name]
+            except KeyError:
+                pass
+            objclass = obj.Class().GetName()
+            try:
+                modelclass = cls.models[objclass]
+            except KeyError:
+                unknown.add(objclass)
+                modelclass = cls.models["_Unknown"]
+
+            model = modelclass.readobj(obj, readobj)
+            model.name = name
+            known[name] = model
+            return model
+
         for item in items:
-            model = cls._readobj(inputs, known, item)
+            model = readobj(item)
             roots[model.name] = model
+
+        print(f"Unknown class types: {unknown}")
         return cls(roots=roots)
 
     @classmethod
@@ -113,25 +134,3 @@ class RooWorkspace:
         else:
             with open(fname, "w") as fout:
                 json.dump(out, fout)
-
-    @classmethod
-    def _readobj(
-        cls, inputs: Dict[str, Any], known: Dict[str, Model], obj: Any
-    ) -> Model:
-        name = _getref(inputs, obj)
-        try:
-            return known[name]
-        except KeyError:
-            pass
-        objclass = obj.Class().GetName()
-        try:
-            modelclass = cls.models[objclass]
-        except KeyError:
-            cls._unknown_classes.add(objclass)
-            modelclass = cls.models["_Unknown"]
-
-        recursor = partial(cls._readobj, inputs, known)
-        model = modelclass.readobj(obj, recursor)
-        model.name = name
-        known[name] = model
-        return model

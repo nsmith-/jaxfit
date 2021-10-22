@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import reduce
 from typing import Dict, List, Optional, Union
 
+import jax
 import jax.numpy as jnp
 import jax.scipy.stats as stats
 import numpy as np
@@ -16,6 +17,7 @@ from jaxfit.roofit.common import (
     RooPoisson,
     RooProdPdf,
     RooProduct,
+    RooRealVar,
 )
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
@@ -207,6 +209,9 @@ class ProcessNormalization(Model, Function):
             )
         )
         symLogKappa = np.zeros(shape=(len(items), len(symParams)))
+        print(
+            f"ProcessNormalization vectorize symmetric modifier shape: {symLogKappa.shape}"
+        )
         for i, c in enumerate(items):
             for p, val in zip(c.symParams, c.symLogKappa):
                 try:
@@ -237,6 +242,9 @@ class ProcessNormalization(Model, Function):
         asymLogKappaSum = jnp.array(asymLogKappaSum)
         asymLogKappaDiff = jnp.array(asymLogKappaDiff)
         asymParams = parameters.arrayof(asymParams)
+        print(
+            f"ProcessNormalization vectorize asymmetric modifier shape: {asymLogKappaSum.shape}"
+        )
 
         additional = [
             c.additional.value(parameters) if c.additional else None for c in items
@@ -255,7 +263,7 @@ class ProcessNormalization(Model, Function):
             addParam = jnp.array([p(param) if p else 1.0 for p in additional])
             return nominal * jnp.exp(symShift + asymShift) * addParam
 
-        return val
+        return jax.jit(val)
 
     def value(self, parameters: ParameterPack):
         symTheta = parameters.arrayof([p.name for p in self.symParams])
@@ -278,7 +286,7 @@ class ProcessNormalization(Model, Function):
                 out = out * addParam(param)
             return out
 
-        return val
+        return jax.jit(val)
 
 
 def _bbparse(obj, functions, recursor):
@@ -348,11 +356,38 @@ class CMSHistErrorPropagator(Model, Distribution):
             bbpars=bbpars,
             bbscale=bbscale,
         )
-        if any(x.name == "RooRealVar:ZERO" for x in out.coefficients):
-            # we should just trim the process from this model
-            raise NotImplementedError("model where one coefficient is fixed to zero")
+        if any(
+            x.name in ("RooRealVar:ZERO", "RooRealVar:ONE") for x in out.coefficients
+        ):
+            # TODO: we should just trim the process from this model
+            raise NotImplementedError(
+                "model where one coefficient is fixed to zero or one"
+            )
         assert all(isinstance(x, CMSHistFunc) for x in out.functions)
-        assert all(isinstance(x, ProcessNormalization) for x in out.coefficients)
+        for i, c in enumerate(out.coefficients):
+            if isinstance(c, ProcessNormalization):
+                pass
+            elif isinstance(c, RooProduct) and all(
+                isinstance(x, (ProcessNormalization, AsymPow)) for x in c.components
+            ):
+                # TODO: handle RooProduct of ProcessNormalization and several AsymPow
+                raise NotImplementedError(
+                    "Try running text2workspace with --X-pack-asympows"
+                )
+            elif isinstance(c, RooRealVar) and c.const:
+                out.coefficients[i] = ProcessNormalization(
+                    nominal=c.val,
+                    symParams=[],
+                    symLogKappa=jnp.array([]),
+                    asymParams=[],
+                    asymLogKappaLo=jnp.array([]),
+                    asymLogKappaHi=jnp.array([]),
+                    additional=None,
+                )
+            else:
+                import pdb
+
+                pdb.set_trace()
         return out
 
     @property
@@ -486,6 +521,7 @@ class CMSHistFunc(Model, Function):
         posmap = {n: i for i, n in enumerate(verticalParams)}
         asymSum = np.zeros(shape=(len(items), len(verticalParams), nbins))
         asymDiff = np.zeros(shape=(len(items), len(verticalParams), nbins))
+        print(f"CMSHistFunc vectorize shape (proc, syst, bin): {asymSum.shape}")
         for i, c in enumerate(items):
             nom = c.nominal
             for p, lo, hi in zip(
@@ -518,7 +554,7 @@ class CMSHistFunc(Model, Function):
                 nominal * jnp.exp(vshift),
             )
 
-        return val
+        return jax.jit(val)
 
     def value(self, parameters: ParameterPack):
         if not len(self.verticalParams):
@@ -550,7 +586,7 @@ class CMSHistFunc(Model, Function):
                 # LogQuadLinear
                 return self.nominal * jnp.exp(vshift)
 
-        return val
+        return jax.jit(val)
 
 
 @RooWorkspace.register
@@ -571,3 +607,55 @@ class SimpleGaussianConstraint(RooGaussian):
             raise RuntimeError()
 
         return out
+
+
+@RooWorkspace.register
+@dataclass
+class AsymPow(Model, Function):
+    kappaLo: Model
+    kappaHi: Model
+    theta: Model
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        # FIXME: in ROOT 6.24 we get proxy accessors (getProxy/numProxies)
+        items = [recursor(x) for x in obj.servers()]
+        if len(items) == 3 and (items[0].const and items[1].const):
+            kappaLo, kappaHi, theta = items
+        elif len(items) == 2 and items[0].const:
+            kappaLo, theta = items
+            kappaHi = kappaLo
+        else:
+            raise RuntimeError("Could not parse AsymPow")
+        out = cls(
+            kappaLo=kappaLo,
+            kappaHi=kappaHi,
+            theta=theta,
+        )
+        return out
+
+
+# hgg TODO
+# CMSHggFormulaA2
+# CMSHggFormulaB2
+# CMSHggFormulaC1
+# CMSHggFormulaD2
+# RooBernsteinFast<1>
+# RooBernsteinFast<2>
+# RooBernsteinFast<3>
+# RooBernsteinFast<4>
+# RooBernsteinFast<5>
+# RooBernsteinFast<6>
+# RooCheapProduct
+# RooExponential
+# RooFormulaVar
+# RooMultiPdf
+# RooPower
+# RooRecursiveFraction
+# hzz TODO
+# RooFormulaVar
+# RooBernstein
+# VerticalInterpPdf
+# RooGenericPdf
+# RooHistPdf
+# RooDoubleCBFast
