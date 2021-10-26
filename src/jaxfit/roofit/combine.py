@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from functools import reduce
 from typing import Dict, List, Optional, Union
 
-import jax
 import jax.numpy as jnp
 import jax.scipy.stats as stats
 import numpy as np
@@ -26,7 +25,10 @@ from jaxfit.types import Array, Distribution, Function
 
 
 def _fasthisto2array(h):
-    return jnp.array([h[i] for i in range(h.size())])
+    out = np.empty(h.size(), dtype="f8")
+    for i in range(h.size()):
+        out[i] = h[i]
+    return jnp.array(out)
 
 
 def _factorize_prodpdf(pdf):
@@ -190,8 +192,10 @@ class ProcessNormalization(Model, Function):
             addpar = RooProduct(components=addpar)
         elif len(addpar) == 0:
             addpar = None
-        else:
+        elif isinstance(addpar[0], RooProduct):
             addpar = addpar[0]
+        else:
+            addpar = RooProduct(components=addpar)
         return cls(
             nominal=obj.getNominalValue(),
             symParams=[recursor(p) for p in obj.getSymErrorParameters()],
@@ -526,22 +530,32 @@ class CMSHistFunc(Model, Function):
     def readobj(cls, obj, recursor):
         if len(obj.getHorizontalMorphs()):
             raise NotImplementedError("horizontal morphs from CMSHistFunc")
-        morphs = [
-            {
-                "param": recursor(p),
-                "lo": _fasthisto2array(obj.getShape(0, 0, i + 1, 0)),
-                "hi": _fasthisto2array(obj.getShape(0, 0, i + 1, 1)),
-            }
-            for i, p in enumerate(obj.getVerticalMorphs())
-        ]
+        nominal = _fasthisto2array(obj.getShape(0, 0, 0, 0))
+        vParam = [recursor(p) for p in obj.getVerticalMorphs()]
+        if vParam:
+            morphLo = np.stack(
+                [
+                    _fasthisto2array(obj.getShape(0, 0, i + 1, 0))
+                    for i in range(len(vParam))
+                ]
+            )
+            morphHi = np.stack(
+                [
+                    _fasthisto2array(obj.getShape(0, 0, i + 1, 1))
+                    for i in range(len(vParam))
+                ]
+            )
+        else:
+            morphLo = np.zeros(shape=(0, len(nominal)))
+            morphHi = np.zeros(shape=(0, len(nominal)))
         out = cls(
             x=recursor(obj.getXVar()),
-            verticalParams=[m["param"] for m in morphs],
-            verticalMorphsLo=jnp.array([m["lo"] for m in morphs]),
-            verticalMorphsHi=jnp.array([m["hi"] for m in morphs]),
+            verticalParams=vParam,
+            verticalMorphsLo=jnp.array(morphLo),
+            verticalMorphsHi=jnp.array(morphHi),
             verticalType=obj.getVerticalType(),
             bberrors=_fasthisto2array(obj.errors()),
-            nominal=_fasthisto2array(obj.getShape(0, 0, 0, 0)),
+            nominal=nominal,
         )
         if len(out.bberrors) != len(out.nominal):
             # assume nominal has correct number of bins always
