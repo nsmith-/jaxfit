@@ -165,14 +165,6 @@ class RooRealSumPdf(Model, Distribution):
         return fpars | cpars
 
     def log_prob(self, observables: DataSlice, parameters: ParameterPack):
-        if (
-            len(self.coefficients) == 1
-            and self.coefficients[0].const
-            and self.coefficients[0].val == 1.0
-        ):
-            # combine adds this extra layer for some reason
-            return self.functions[0].log_prob(observables, parameters)
-
         funcs = [f.log_prob(observables, parameters) for f in self.functions]
         coefs = [c.value(parameters) for c in self.coefficients]
 
