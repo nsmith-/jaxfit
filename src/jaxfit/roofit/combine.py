@@ -279,7 +279,7 @@ class ProcessNormalization(Model, Function):
         for ich, ch in enumerate(items):
             for iproc, proc in enumerate(ch):
                 if proc.additional is not None:
-                    addparam.append(proc.additional.value(parameters))
+                    addparam.append(proc.additional)
                     addpos0.append(ich)
                     addpos1.append(iproc)
 
@@ -288,6 +288,7 @@ class ProcessNormalization(Model, Function):
         print(
             f"ProcessNormalization vectorize additional params: {len(addparam)} ({len(addparam)*100/nch/nproc:.0f}%)"
         )
+        addparam = RooProduct.vectorize(addparam, parameters)
 
         def val(param):
             symShift = jnp.sum(symLogKappa * symParams(param), axis=2)
@@ -299,11 +300,7 @@ class ProcessNormalization(Model, Function):
                 ),
                 axis=2,
             )
-            addFactor = (
-                jnp.ones_like(nominal)
-                .at[addpos0, addpos1]
-                .set(jnp.array([p(param) for p in addparam]))
-            )
+            addFactor = jnp.ones_like(nominal).at[addpos0, addpos1].set(addparam(param))
             return nominal * jnp.exp(symShift + asymShift) * addFactor
 
         return val

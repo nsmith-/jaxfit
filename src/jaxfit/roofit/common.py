@@ -98,28 +98,49 @@ class RooProduct(Model, Function):
     def parameters(self):
         return reduce(set.union, (x.parameters for x in self.components), set())
 
-    def value(self, parameters):
-        factors = sorted(_factorize_prod(self), key=lambda p: p.name)
+    @classmethod
+    def vectorize(cls, items: List["RooProduct"], parameters: ParameterPack):
+        factors = [
+            sorted(_factorize_prod(item), key=lambda p: p.name) for item in items
+        ]
+        n = len(items)
+        parents = [i for i, vals in enumerate(factors) for _ in vals]
+        factors = [p for vals in factors for p in vals]
         canVectorize = [isinstance(p, RooRealVar) for p in factors]
-        if any(canVectorize):
-            vparam = parameters.arrayof(
-                [
-                    p.val if p.const else p.name
-                    for p, v in zip(factors, canVectorize)
+        nvect = sum(canVectorize)
+        if nvect > 0:
+            vIdx, vParam = zip(
+                *(
+                    (parent, p.val if p.const else p.name)
+                    for parent, p, v in zip(parents, factors, canVectorize)
                     if v
-                ]
-            )
-            addParam = [
-                p.value(parameters) for p, v in zip(factors, canVectorize) if not v
-            ]
-            if len(addParam):
-                return lambda param: reduce(
-                    jnp.multiply, (v(param) for v in addParam), jnp.prod(vparam(param))
                 )
-            else:
-                return lambda param: jnp.prod(vparam(param))
+            )
+            vIdx = jnp.array(vIdx)
+            vParam = parameters.arrayof(vParam)
 
-        addParam = [p.value(parameters) for p in factors]
+        if nvect < len(factors):
+            addIdx, addParam = zip(
+                *(
+                    (parent, p.value(parameters))
+                    for parent, p, v in zip(parents, factors, canVectorize)
+                    if not v
+                )
+            )
+            addIdx = jnp.array(addIdx)
+
+        def val(param):
+            out = jnp.ones(n)
+            if nvect > 0:
+                out = out.at[vIdx].multiply(vParam(param))
+            if nvect < len(factors):
+                out = out.at[addIdx].multiply(jnp.array([p(param) for p in addParam]))
+            return out
+
+        return val
+
+    def value(self, parameters):
+        addParam = [p.value(parameters) for p in self.components]
         return lambda param: reduce(jnp.multiply, (v(param) for v in addParam))
 
 

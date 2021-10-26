@@ -1,5 +1,6 @@
 from dataclasses import dataclass, fields
 
+import numpy as np
 import jax.numpy as jnp
 
 from jaxfit.types import Array
@@ -29,7 +30,8 @@ def _fromdict(obj, deref):
     elif isinstance(obj, dict) and "$ref" in obj:
         return deref(obj["$ref"])
     elif isinstance(obj, dict) and "$array" in obj:
-        return jnp.array(obj["$array"])
+        # slightly faster to have numpy convert first
+        return jnp.array(np.array(obj["$array"]))
     raise RuntimeError(f"Unrecognized object in serialization: {obj}")
 
 
