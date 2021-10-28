@@ -19,6 +19,7 @@ from jaxfit.roofit.common import (
     RooProduct,
     RooRealSumPdf,
     RooRealVar,
+    RooUniform,
 )
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
@@ -90,10 +91,14 @@ class RooSimultaneousOpt(Model, Distribution):
         for cat, catp in self.pdfs.items():
             for pdf in _factorize_prodpdf(catp):
                 obs = list(pdf.observables)
-                if len(obs) != 1:
+                if len(obs) > 1:
                     raise RuntimeError(
                         f"Unfactorized pdf: {pdf.name}, observables {obs}"
                     )
+                elif len(obs) == 0:
+                    if isinstance(pdf, RooUniform):
+                        continue
+                    raise RuntimeError(f"pdf with no observable? {pdf.name}")
                 obs = obs[0]
                 if isinstance(pdf, RooGaussian):
                     if not obs.endswith("_In"):
@@ -126,7 +131,6 @@ class RooSimultaneousOpt(Model, Distribution):
                         raise RuntimeError("did we over-factorize?")
                     generic[cat] = pdf.log_prob(observables, parameters)
 
-        print(gaus_constr)
         gaus_constr = sorted((x, mu, sigma) for x, (mu, sigma) in gaus_constr.items())
         gausx = observables.arrayof({p: None for p, _, _ in gaus_constr}, "aux")
         gausm = parameters.arrayof([p for _, p, _ in gaus_constr])

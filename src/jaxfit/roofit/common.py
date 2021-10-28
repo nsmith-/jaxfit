@@ -356,6 +356,20 @@ class RooUniform(Model):
         x = [recursor(x) for x in obj.servers()]
         return cls(x=x)
 
+    @property
+    def observables(self):
+        return set()
+
+    @property
+    def parameters(self):
+        return reduce(set.union, (x.parameters for x in self.x), set())
+
+    def log_prob(self, observables: DataPack, parameters: ParameterPack):
+        def logp(data, param):
+            return 1.0
+
+        return logp
+
 
 @RooWorkspace.register
 @dataclass
