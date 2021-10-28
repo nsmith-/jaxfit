@@ -8,8 +8,9 @@ import jax.numpy as jnp
 import jax.scipy.stats as stats
 import numpy as np
 
-from jaxfit.roofit._util import DataPack, DataSlice, ParameterPack
+from jaxfit.roofit._util import ParameterPack
 from jaxfit.roofit.common import (
+    DataPack,
     RooCategory,
     RooConstVar,
     RooGaussian,
@@ -123,17 +124,20 @@ class RooSimultaneousOpt(Model, Distribution):
                     # probably better to fix combine structure in the beginning..
                     if cat in generic:
                         raise RuntimeError("did we over-factorize?")
-                    generic[cat] = pdf.log_prob(observables.slice(cat), parameters)
+                    generic[cat] = pdf.log_prob(observables, parameters)
 
+        print(gaus_constr)
         gaus_constr = sorted((x, mu, sigma) for x, (mu, sigma) in gaus_constr.items())
-        gausx = observables.arrayof([p for p, _, _ in gaus_constr])
+        gausx = observables.arrayof({p: None for p, _, _ in gaus_constr}, "aux")
         gausm = parameters.arrayof([p for _, p, _ in gaus_constr])
         gauss = parameters.arrayof([p for _, _, p in gaus_constr])
         pois_constr = sorted((x, mu) for x, mu in pois_constr.items())
-        poisx = observables.arrayof([p for p, _ in pois_constr])
+        poisx = observables.arrayof({p: None for p, _ in pois_constr}, "aux")
         poism = parameters.arrayof([p for _, p in pois_constr])
 
-        hist_lp = CMSHistErrorPropagator.vectorize(cms_hists, observables, parameters)
+        hist_lp = CMSHistErrorPropagator.vectorize(
+            cms_hists, observables, parameters, self.indexCat.name
+        )
 
         def logp(data, param):
             out = jnp.sum(
@@ -457,13 +461,15 @@ class CMSHistErrorPropagator(Model, Distribution):
     def vectorize(
         cls,
         channels: Dict[str, "CMSHistErrorPropagator"],
-        observables: DataSlice,
+        observables: DataPack,
         parameters: ParameterPack,
+        cat: str,
     ):
         # (ch, proc, bin)
         procvals, mask, bb_errors = CMSHistFunc.vectorize(
             [ch.functions for ch in channels.values()], parameters
         )
+        nch, nproc, nbin = mask.shape
         procnorms = ProcessNormalization.vectorize(
             [ch.coefficients for ch in channels.values()], parameters
         )
@@ -482,13 +488,16 @@ class CMSHistErrorPropagator(Model, Distribution):
         bbparams = parameters.arrayof(list(bbparams.flatten()))
 
         # TODO: better gathering of observed yields
-        obs_stack = [
-            observables.slice(cat).arrayof(ch.x.binning.edges)
-            for cat, ch in channels.items()
-        ]
+        bindim = next(iter(channels.values())).x
+        edges = bindim.binning.edges
+        if not all(jnp.all(ch.x.binning.edges == edges) for ch in channels.values()):
+            raise NotImplementedError("Varied binnings")
+        obs_stack = observables.arrayof(
+            {cat: list(channels), bindim.name: edges}, "binned"
+        )
 
         def logp(data, param):
-            observed = jnp.array([get(data) for get in obs_stack])
+            observed = obs_stack(data)
             process_expected = procnorms(param)[:, :, None] * procvals(param)
             # here we can do analytic Balow-Beeston in principle
             bb = bbparams(param).reshape(bb_errors.shape)
@@ -508,7 +517,7 @@ class CMSHistErrorPropagator(Model, Distribution):
 
         return logp
 
-    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+    def log_prob(self, observables: DataPack, parameters: ParameterPack):
         raise NotImplementedError("This should be vectorized")
 
 

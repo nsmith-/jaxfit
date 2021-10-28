@@ -1,6 +1,6 @@
 from collections import defaultdict
-from functools import partial, reduce
-from typing import Dict, List, Tuple, Union
+from functools import partial
+from typing import Dict, List, Union
 
 import jax.numpy as jnp
 import numpy as np
@@ -132,86 +132,3 @@ class ParameterPack:
     def index(self, param: str):
         self.finalize()
         return self._flat.index(param)
-
-
-class DataSlice:
-    def __init__(self, parent: "DataSlice", cat: str):
-        self._parent = parent
-        self._cat = cat
-
-    def slice(self, cat: str):
-        return DataSlice(self, cat)
-
-    def _array(self, obs: Union[List[str], Array], path: Tuple[str]):
-        return self._parent._array(obs, (self._cat,) + path)
-
-    def arrayof(self, obs: Union[List[str], Array]):
-        """Return function to fetch data array from input
-
-        obs can either be a list of observables (which will be columns in the
-        return array), or it can be an array which encodes the edges of a 1D binning
-        """
-        return self._parent._array(obs, (self._cat,))
-
-
-class DataPack(DataSlice):
-    def __init__(self):
-        self._auxdata = ParameterPack()
-        self._slices = {}
-
-    def _array(self, obs: Union[List[str], Array], path: Tuple[str]):
-        if path in self._slices:
-            raise RuntimeError(f"Data used twice! path: {path}")
-        if path[0] == "_aux_":
-            raise RuntimeError("aux is a protected name, please change category name")
-        self._slices[path] = obs
-        return lambda data: data[path]
-
-    def arrayof(self, obs: List[str]):
-        """Return function to fetch data array from input
-
-        For DataPack (a top-level object) this can only be
-        a list of observables, which will be assumed to be auxiliary
-        data (i.e. they have one point) and the
-        callable will return a single row vector
-        """
-        unpack = self._auxdata.arrayof(obs)
-        return lambda data: unpack(data[("_aux_",)])
-
-    def ravel(self, data, auxdata: Dict[str, float]) -> Dict[Tuple[str], Array]:
-        # NB data is RooDataSet but circular import.. need to move some of this
-        out = {("_aux_",): self._auxdata.ravel(auxdata)}
-        categories = data.categories()
-        for k, v in self._slices.items():
-            # TODO check that k matches the observables in data
-            if len(k) != len(categories):
-                raise RuntimeError("Expected data to have same categories as slice")
-            cut = reduce(
-                jnp.logical_and,
-                (
-                    data.points[col, :] == cat.labels.index(key)
-                    for (col, cat), key in zip(categories, k)
-                ),
-            )
-            catdata = data.points[:, cut]
-            if isinstance(v, list):
-                cols = []
-                for colname in v:
-                    for i, col in data.variables():
-                        if col.name == colname:
-                            cols.append(i)
-                if len(cols) != len(v):
-                    raise RuntimeError("missing columns")
-                out[k] = catdata[tuple(cols), :]
-            else:
-                if len(data.variables()) != 2:
-                    raise NotImplementedError("Binned data in multiple dimensions?")
-                col, var = data.variables()[0]
-                # at least for combine this ends up being bin centers
-                # and for some reason isn't truncated
-                centers = catdata[col, : len(v) - 1]
-                if not jnp.all(centers == 0.5 * (v[1:] + v[:-1])):
-                    raise RuntimeError("Data centers do not match expected binning")
-                assert data.variables()[-1][1].name == "RooRealVar:_weight_"
-                out[k] = catdata[-1, : len(v) - 1]
-        return out

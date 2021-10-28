@@ -2,18 +2,95 @@
 """
 from dataclasses import dataclass
 from functools import reduce
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any, Literal
 
 import jax.numpy as jnp
 import jax.scipy.stats as stats
 import numpy as np
 
-from jaxfit.roofit._util import DataSlice, ParameterPack, _importROOT
+from jaxfit.roofit._util import ParameterPack, _importROOT
 from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
 from jaxfit.types import Array, Distribution, Function, Parameter
 
 BREAK_UNKNOWN = False
+
+
+class DataPack:
+    def __init__(self):
+        self._auxdata = ParameterPack()
+        self._binned = {}
+        self._unbinned = {}
+
+    def arrayof(self, obs: Dict[str, Any], kind: Literal["aux", "binned", "unbinned"]):
+        """Return function to fetch data array from input"""
+        if kind == "aux":
+            unpack = self._auxdata.arrayof(list(obs))
+            return lambda data: unpack(data["_aux_"])
+        key = hex(id(obs))  # arbitrary
+        if kind == "binned":
+            self._binned[key] = obs
+        else:
+            self._unbinned[key] = obs
+        return lambda data: data[key]
+
+    def ravel(
+        self, data: "RooDataSet", auxdata: Dict[str, float]
+    ) -> Dict[Tuple[str], Array]:
+        out = {"_aux_": self._auxdata.ravel(auxdata)}
+        obsmap = {obs.name: (i, obs) for i, obs in enumerate(data.observables)}
+        for key, axes in self._binned.items():
+            # TODO this is trash
+            catinfo = None
+            bininfo = None
+            for name, vals in axes.items():
+                idx, obs = obsmap[name]
+                if isinstance(obs, RooCategory):
+                    if catinfo is not None:
+                        raise RuntimeError("only supports one category")
+                    catinfo = vals, idx, obs
+                elif isinstance(obs, RooRealVar):
+                    if bininfo is not None:
+                        raise RuntimeError("only supports one binned axis")
+                    bininfo = vals, idx, obs
+
+            if catinfo is None or bininfo is None:
+                raise RuntimeError(
+                    "all binned data needs a category or binning for now"
+                )
+
+            catvals, catidx, catobs = catinfo
+            binedges, binidx, _ = bininfo
+            binvals = 0.5 * (binedges[1:] + binedges[:-1])
+            arr = []
+            for val in catvals:
+                pts = data.points[:, data.points[catidx, :] == catobs.labels.index(val)]
+                if not jnp.all(pts[binidx, :] == binvals):
+                    raise RuntimeError("binning mismatch")
+                # _weight_ index always last
+                arr.append(pts[-1, :])
+            out[key] = jnp.stack(arr)
+
+        for key, axes in self._unbinned.items():
+            catinfo = None
+            cols = []
+            for name, val in axes.items():
+                idx, obs = obsmap[name]
+                if isinstance(obs, RooCategory):
+                    if catinfo is not None:
+                        raise RuntimeError("only supports one category")
+                    catinfo = val, idx, obs
+                elif isinstance(obs, RooRealVar):
+                    cols.append(idx)
+
+            if catinfo is None:
+                raise RuntimeError("all unbinned data needs a category")
+
+            catval, catidx, catobs = catinfo
+            cut = data.points[catidx, :] == catobs.labels.index(catval)
+            out[key] = data.points[:, cut][cols, :]
+
+        return out
 
 
 @RooWorkspace.register
@@ -50,7 +127,7 @@ class RooProdPdf(Model, Distribution):
     def parameters(self):
         return reduce(set.union, (pdf.parameters for pdf in self.pdfs), set())
 
-    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+    def log_prob(self, observables: DataPack, parameters: ParameterPack):
         vals = [pdf.log_prob(observables, parameters) for pdf in self.pdfs]
 
         def logp(data, param):
@@ -185,7 +262,7 @@ class RooRealSumPdf(Model, Distribution):
         cpars = reduce(set.union, (x.parameters for x in self.coefficients), set())
         return fpars | cpars
 
-    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+    def log_prob(self, observables: DataPack, parameters: ParameterPack):
         funcs = [f.log_prob(observables, parameters) for f in self.functions]
         coefs = [c.value(parameters) for c in self.coefficients]
 
@@ -217,7 +294,7 @@ class RooPoisson(Model, Distribution):
     def parameters(self):
         return self.mean.parameters
 
-    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+    def log_prob(self, observables: DataPack, parameters: ParameterPack):
         x = observables.arrayof([self.x.name])
         mu = parameters.arrayof([self.mean.name])
 
@@ -252,7 +329,7 @@ class RooGaussian(Model):
     def parameters(self):
         return self.mean.parameters | self.sigma.parameters
 
-    def log_prob(self, observables: DataSlice, parameters: ParameterPack):
+    def log_prob(self, observables: DataPack, parameters: ParameterPack):
         raise RuntimeError("unvectorized gaussian")
         x = observables.arrayof([self.x.name])
         loc = parameters.arrayof([self.mean.name])
