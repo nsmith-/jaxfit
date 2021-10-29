@@ -56,6 +56,7 @@ class RooSimultaneousOpt(Model, Distribution):
 
     indexCat: RooCategory
     pdfs: Dict[str, Model]
+    constraints: List[Model]
 
     @classmethod
     def readobj(cls, obj, recursor):
@@ -63,20 +64,23 @@ class RooSimultaneousOpt(Model, Distribution):
         return cls(
             indexCat=recursor(cat),
             pdfs={label: recursor(obj.getPdf(label)) for label, idx in cat.states()},
-            # obj.extraConstraints()
+            constraints=[recursor(x) for x in obj.extraConstraints()],
             # obj.channelMasks()
         )
 
     @property
     def observables(self):
         out = reduce(set.union, (pdf.observables for pdf in self.pdfs.values()), set())
+        out |= reduce(set.union, (pdf.observables for pdf in self.constraints), set())
         if out & {self.indexCat.name}:
             raise RuntimeError("gotta think")
         return out | {self.indexCat.name}
 
     @property
     def parameters(self):
-        return reduce(set.union, (pdf.parameters for pdf in self.pdfs.values()), set())
+        out = reduce(set.union, (pdf.parameters for pdf in self.pdfs.values()), set())
+        out |= reduce(set.union, (pdf.parameters for pdf in self.constraints), set())
+        return out
 
     def log_prob(self, observables: DataPack, parameters: ParameterPack):
         """Combine-specific log_prob
@@ -88,48 +92,55 @@ class RooSimultaneousOpt(Model, Distribution):
         cms_hists = {}
         gaus_constr = {}
         pois_constr = {}
+
+        def sortpdf(pdf, cat):
+            obs = list(pdf.observables)
+            if len(obs) > 1:
+                raise RuntimeError(f"Unfactorized pdf: {pdf.name}, observables {obs}")
+            elif len(obs) == 0:
+                if isinstance(pdf, RooUniform):
+                    return
+                raise RuntimeError(f"pdf with no observable? {pdf.name}")
+            obs = obs[0]
+            if isinstance(pdf, RooGaussian):
+                if not obs.endswith("_In"):
+                    raise RuntimeError(
+                        f"Expected {pdf.name} to have a global observable-like name, instead have {obs}"
+                    )
+                if obs in gaus_constr:
+                    # check same constraint?
+                    return
+                gaus_constr[obs] = (
+                    pdf.mean.val if pdf.mean.const else pdf.mean.name,
+                    pdf.sigma.val if pdf.sigma.const else pdf.sigma.name,
+                )
+            elif isinstance(pdf, RooPoisson):
+                if not obs.endswith("_In"):
+                    raise RuntimeError(
+                        f"Expected {pdf.name} to have a global observable-like name, instead have {obs}"
+                    )
+                if obs in pois_constr:
+                    # check same constraint?
+                    return
+                pois_constr[obs] = pdf.mean.val if pdf.mean.const else pdf.mean.name
+            elif cat is None:
+                raise RuntimeError("Unknown constraint pdf")
+            elif isinstance(pdf, CMSHistErrorPropagator):
+                cms_hists[cat] = pdf
+            else:
+                # this pdf has observables that may depend on cat
+                # and anyway we delegate construction to it
+                # probably better to fix combine structure in the beginning..
+                if cat in generic:
+                    raise RuntimeError("did we over-factorize?")
+                generic[cat] = pdf.log_prob(observables, parameters)
+
         for cat, catp in self.pdfs.items():
             for pdf in _factorize_prodpdf(catp):
-                obs = list(pdf.observables)
-                if len(obs) > 1:
-                    raise RuntimeError(
-                        f"Unfactorized pdf: {pdf.name}, observables {obs}"
-                    )
-                elif len(obs) == 0:
-                    if isinstance(pdf, RooUniform):
-                        continue
-                    raise RuntimeError(f"pdf with no observable? {pdf.name}")
-                obs = obs[0]
-                if isinstance(pdf, RooGaussian):
-                    if not obs.endswith("_In"):
-                        raise RuntimeError(
-                            f"Expected {pdf.name} to have a global observable-like name, instead have {obs}"
-                        )
-                    if obs in gaus_constr:
-                        # check same constraint?
-                        continue
-                    gaus_constr[obs] = (
-                        pdf.mean.val if pdf.mean.const else pdf.mean.name,
-                        pdf.sigma.val if pdf.sigma.const else pdf.sigma.name,
-                    )
-                elif isinstance(pdf, RooPoisson):
-                    if not obs.endswith("_In"):
-                        raise RuntimeError(
-                            f"Expected {pdf.name} to have a global observable-like name, instead have {obs}"
-                        )
-                    if obs in pois_constr:
-                        # check same constraint?
-                        continue
-                    pois_constr[obs] = pdf.mean.val if pdf.mean.const else pdf.mean.name
-                elif isinstance(pdf, CMSHistErrorPropagator):
-                    cms_hists[cat] = pdf
-                else:
-                    # this pdf has observables that may depend on cat
-                    # and anyway we delegate construction to it
-                    # probably better to fix combine structure in the beginning..
-                    if cat in generic:
-                        raise RuntimeError("did we over-factorize?")
-                    generic[cat] = pdf.log_prob(observables, parameters)
+                sortpdf(pdf, cat)
+
+        for pdf in self.constraints:
+            sortpdf(pdf, None)
 
         gaus_constr = sorted((x, mu, sigma) for x, (mu, sigma) in gaus_constr.items())
         gausx = observables.arrayof({p: None for p, _, _ in gaus_constr}, "aux")
@@ -170,8 +181,8 @@ def _asym_interpolation(x, dx_sum, dx_diff):
     """
     ax = abs(x)
     morph = 0.5 * (
-        dx_sum * x
-        + dx_diff
+        dx_diff * x
+        + dx_sum
         * jnp.where(
             ax > 1.0,
             ax,
@@ -194,7 +205,7 @@ class ProcessNormalization(Model, Function):
 
     @classmethod
     def readobj(cls, obj, recursor):
-        asympar = [[-lo, hi] for lo, hi in obj.getAsymLogKappa()]
+        asympar = [[lo, hi] for lo, hi in obj.getAsymLogKappa()]
         addpar = [recursor(p) for p in obj.getAdditionalModifiers()]
         if len(addpar) > 1:
             addpar = RooProduct(components=addpar)
@@ -383,7 +394,7 @@ def _bbparse(obj, functions, recursor):
     # transpose (bin, proc) -> (proc, bin)
     bbpars = list(list(bp) for bp in np.array(bbpars).T)
     bbscale = np.array(bbscale).T
-    return bbpars, jnp.array(bbscale)
+    return bbpars, jnp.array(bbscale, ndmin=2)
 
 
 @RooWorkspace.register
@@ -419,7 +430,8 @@ class CMSHistErrorPropagator(Model, Distribution):
             if isinstance(c, ProcessNormalization):
                 pass
             elif isinstance(c, RooProduct) and all(
-                isinstance(x, (ProcessNormalization, AsymPow)) for x in c.components
+                isinstance(x, (RooRealVar, ProcessNormalization, AsymPow))
+                for x in c.components
             ):
                 # TODO: handle RooProduct of ProcessNormalization and several AsymPow
                 raise NotImplementedError(
@@ -645,8 +657,10 @@ class CMSHistFunc(Model, Function):
                         asymSum[ich, iproc, :n, pos] = hi + lo - 2 * proc.nominal
                         asymDiff[ich, iproc, :n, pos] = hi - lo
                     else:
-                        asymSum[ich, iproc, :n, pos] = np.log(hi / proc.nominal)
-                        asymDiff[ich, iproc, :n, pos] = np.log(lo / proc.nominal)
+                        asymSum[ich, iproc, :n, pos] = (
+                            np.log(hi) + np.log(lo) - 2 * np.log(proc.nominal)
+                        )
+                        asymDiff[ich, iproc, :n, pos] = np.log(hi) - np.log(lo)
 
         verticalParams = parameters.arrayof(verticalParams)
 
@@ -659,7 +673,7 @@ class CMSHistFunc(Model, Function):
             )
             return jnp.where(
                 (verticalType == 0)[:, :, None],
-                nominal + 3 * vshift,
+                nominal + vshift,
                 nominal * jnp.exp(vshift),
             )
 
@@ -689,8 +703,7 @@ class CMSHistFunc(Model, Function):
             )
             if self.verticalType == 0:
                 # QuadLinear
-                # TODO: why 3x!!
-                return self.nominal + 3 * vshift
+                return self.nominal + vshift
             elif self.verticalType == 1:
                 # LogQuadLinear
                 return self.nominal * jnp.exp(vshift)
@@ -745,10 +758,6 @@ class AsymPow(Model, Function):
 
 
 # hgg TODO
-# CMSHggFormulaA2
-# CMSHggFormulaB2
-# CMSHggFormulaC1
-# CMSHggFormulaD2
 # RooBernsteinFast<1>
 # RooBernsteinFast<2>
 # RooBernsteinFast<3>
@@ -757,14 +766,14 @@ class AsymPow(Model, Function):
 # RooBernsteinFast<6>
 # RooCheapProduct
 # RooExponential
-# RooFormulaVar
 # RooMultiPdf
 # RooPower
 # RooRecursiveFraction
 # hzz TODO
-# RooFormulaVar
 # RooBernstein
 # VerticalInterpPdf
 # RooGenericPdf
 # RooHistPdf
 # RooDoubleCBFast
+# simple TODO
+# FastVerticalInterpHistPdf2

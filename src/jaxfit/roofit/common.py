@@ -13,7 +13,7 @@ from jaxfit.roofit.model import Model
 from jaxfit.roofit.workspace import RooWorkspace
 from jaxfit.types import Array, Distribution, Function, Parameter
 
-BREAK_UNKNOWN = False
+BREAK_UNKNOWN = True
 
 
 class DataPack:
@@ -219,6 +219,31 @@ class RooProduct(Model, Function):
     def value(self, parameters):
         addParam = [p.value(parameters) for p in self.components]
         return lambda param: reduce(jnp.multiply, (v(param) for v in addParam))
+
+
+@RooWorkspace.register
+@dataclass
+class RooFormulaVar(Model, Function):
+    formula: str
+    parameters: List[Model]
+
+    @classmethod
+    def readobj(cls, obj, recursor):
+        return cls(
+            formula=obj.formula().formulaString(),
+            parameters=[recursor(x) for x in obj.servers()],
+        )
+
+    @property
+    def parameters(self):
+        return reduce(set.union, (x.parameters for x in self.parameters), set())
+
+    @classmethod
+    def vectorize(cls, items: List["RooFormulaVar"], parameters: ParameterPack):
+        raise NotImplementedError
+
+    def value(self, parameters):
+        raise NotImplementedError
 
 
 @RooWorkspace.register
